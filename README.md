@@ -43,7 +43,7 @@ Session state (login cookies, screenshots) is written to
 ### Install from source (developers)
 
 ```bash
-git clone https://github.com/pu-orfe/ccworks.git
+git clone https://github.com/pu-shd/ccworks.git
 cd ccworks
 ./ccworks setup       # creates .venv, `pip install -e .`, installs chromium
 ```
