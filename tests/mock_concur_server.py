@@ -987,15 +987,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
-        async function submitReport(reportName) {
-            await fetch('/api/reports/submit', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ report_name: reportName })
-            });
-            alert('Report submitted successfully!');
-            closeReportDetails();
-            fetchReports();
+        async function submitReport() {
+            // Real Concur does not submit on this click. It opens a
+            // report-totals confirmation as a full-screen overlay, and the
+            // report stays in draft until the dialog's own button is clicked.
+            // The toolbar button remains in the DOM behind the overlay and
+            // still matches button:has-text('Submit Report'), which is what
+            // made a page-wide .first locator resolve to the covered button
+            // and time out.
+            const reportName = selectedReportName;
+
+            const overlay = document.createElement('div');
+            overlay.id = 'report-totals-overlay';
+            overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.35); z-index:9000; display:flex; align-items:center; justify-content:center;';
+
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'dialog');
+            dialog.setAttribute('aria-modal', 'true');
+            dialog.setAttribute('data-nuiexp', 'report-totals-modal');
+            dialog.className = 'sapcnqr-dialog report-totals-modal sapcnqr-dialog__fade sapcnqr-dialog__fade--in';
+            dialog.style.cssText = 'background:white; border-radius:6px; padding:25px; width:380px;';
+            dialog.innerHTML = '<h3>Report Totals</h3><p>Amount Due Employee: <strong>$0.00</strong></p>';
+
+            const confirmBtn = document.createElement('button');
+            confirmBtn.className = 'button';
+            confirmBtn.id = 'totals-modal-submit-btn';
+            confirmBtn.setAttribute('data-nuiexp', 'reportTotalsModal.submitButton');
+            confirmBtn.style.cssText = 'background:#0070d2; color:white; margin-right:10px;';
+            confirmBtn.innerText = 'Submit Report';
+            confirmBtn.onclick = async () => {
+                await fetch('/api/reports/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ report_name: reportName })
+                });
+                overlay.remove();
+                closeReportDetails();
+                fetchReports();
+            };
+
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'button';
+            cancelBtn.innerText = 'Cancel';
+            cancelBtn.style.cssText = 'background:#e0e5ea;';
+            cancelBtn.onclick = () => { overlay.remove(); };
+
+            dialog.appendChild(confirmBtn);
+            dialog.appendChild(cancelBtn);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
         }
 
         function closeReportDetails() {
