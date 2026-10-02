@@ -1410,9 +1410,18 @@ def run_tests():
                     browser_client = ConcurBrowserClient()
                     res = browser_client.submit_report(report_name=report_name_val, headless=True)
                 
-                summary = f"\n[SUCCESS] Successfully submitted report: '{report_name_val}'\n"
+                # submit_report returns success=False when it clicked but could
+                # not verify the report left draft. Printing [SUCCESS] for that
+                # is how an unsubmitted report gets reported as submitted.
+                if res.get("success"):
+                    summary = f"\n[SUCCESS] Successfully submitted report: '{report_name_val}'\n"
+                else:
+                    summary = (f"\n[WARNING] Submit was clicked but could not be verified for "
+                               f"'{report_name_val}'. Check the report in Concur.\n")
                 summary += "=" * 60
                 output_result(res, summary)
+                if not res.get("success"):
+                    sys.exit(1)
             except ConcurSessionExpiredError as e:
                 handle_session_expired(e)
             except Exception as e:

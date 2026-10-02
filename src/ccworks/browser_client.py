@@ -213,6 +213,22 @@ class ConcurBrowserClient:
                           "[data-nuiexp='receipt-body'], "
                           "[data-nuiexp='receipt-viewer-metadata'], #upload-receipt-button")
 
+    # Submitting is two clicks. The toolbar button opens a report-totals
+    # confirmation rendered as a full-screen overlay; the report is not
+    # submitted until the dialog's own button is clicked. The toolbar button
+    # stays in the DOM behind the overlay and still matches
+    # button:has-text('Submit Report'), so a page-wide locator taking .first
+    # resolves to the covered button and times out against the overlay
+    # ("subtree intercepts pointer events") while the report stays in draft.
+    # The confirmation must be scoped to inside the dialog.
+    SUBMIT_CONFIRM_DIALOG = ("[data-nuiexp='report-totals-modal'], "
+                             ".report-totals-modal, "
+                             "[role='dialog'][aria-modal='true']")
+    SUBMIT_CONFIRM_BUTTON = ("button:has-text('Submit Report'), "
+                             ".sapMBtn:has-text('Submit Report'), "
+                             "button:has-text('Accept & Submit'), "
+                             "button:has-text('Submit')")
+
     # One definition of the editable fields on an expense, shared by every write
     # path. These were duplicated per-caller, and the copies drifted: one grew a
     # read-back check and a re-focus after clearing, the others did not, so the
@@ -4052,40 +4068,73 @@ class ConcurBrowserClient:
                 self._wait_for_report_view(page)
                 self._take_screenshot(page, "submit_report_opened")
 
+                # A leftover timeline / What's New overlay intercepts pointer
+                # events on the report view, so clear it before reaching for
+                # the toolbar button.
+                self._dismiss_modals(page)
+
                 # Click Submit Report
                 # The button ID #submit-entire-report-btn is often used in the modern UI
                 submit_btn = page.locator("#submit-entire-report-btn, button:has-text('Submit Report')").filter(visible=True).first
-                
-                if submit_btn.count() > 0 and submit_btn.is_enabled():
-                    # Register dialog accept handler for the confirmation popup
-                    page.on("dialog", lambda dialog: dialog.accept())
-                    
-                    submit_btn.click()
-                    logger.info("Clicked 'Submit Report' button.")
-                    
-                    # Wait for a potential second confirmation button (modern UI often has a summary dialog)
-                    page.wait_for_timeout(2000)
-                    final_confirm = page.locator("button:has-text('Submit Report'), .sapMBtn:has-text('Submit Report')").filter(visible=True).first
-                    if final_confirm.count() > 0 and final_confirm.is_enabled():
-                        final_confirm.click()
-                        logger.info("Clicked final 'Submit Report' confirmation.")
-                    
-                    page.wait_for_timeout(5000)
-                    self._take_screenshot(page, "submit_report_final")
-                    
-                    # Verify if we are back on the dashboard or see a success message
-                    if page.locator("text=Report Successfully Submitted").count() > 0 or page.url.endswith("/nui/expense"):
-                        logger.info("Report successfully submitted!")
-                        return {"success": True, "message": "Report successfully submitted"}
-                    else:
-                        logger.warning("Submit button clicked, but could not verify success message. Please check manually.")
-                        return {"success": True, "message": "Submit clicked, verification pending"}
+
+                if submit_btn.count() == 0:
+                    raise RuntimeError("Submit Report button not found on this page.")
+                if not submit_btn.is_enabled():
+                    raise RuntimeError("Submit Report button is disabled. Ensure all alerts are resolved and justifications are filled.")
+
+                # Register dialog accept handler for native confirm()/alert()
+                page.on("dialog", lambda dialog: dialog.accept())
+
+                submit_btn.click()
+                logger.info("Clicked 'Submit Report' button.")
+
+                # The report-totals confirmation is where submission actually
+                # happens. Scope the click to inside the dialog: the toolbar
+                # button behind the overlay still matches the same text and is
+                # unclickable, so a page-wide .first would time out here and
+                # leave the report in draft.
+                confirmed = False
+                dialog = page.locator(self.SUBMIT_CONFIRM_DIALOG).filter(visible=True).first
+                try:
+                    dialog.wait_for(state="visible", timeout=15000)
+                except PlaywrightTimeoutError:
+                    logger.info("No report-totals confirmation appeared; treating the first click as the submit.")
                 else:
-                    # Check if it's already submitted or disabled
-                    if submit_btn.count() > 0 and not submit_btn.is_enabled():
-                        raise RuntimeError("Submit Report button is disabled. Ensure all alerts are resolved and justifications are filled.")
-                    else:
-                        raise RuntimeError("Submit Report button not found on this page.")
+                    self._take_screenshot(page, "submit_report_totals_dialog")
+                    confirm_btn = dialog.locator(self.SUBMIT_CONFIRM_BUTTON).filter(visible=True).first
+                    try:
+                        confirm_btn.wait_for(state="visible", timeout=10000)
+                        confirm_btn.click()
+                        confirmed = True
+                        logger.info("Clicked 'Submit Report' inside the report-totals confirmation.")
+                    except PlaywrightTimeoutError as exc:
+                        raise RuntimeError(
+                            "Report-totals confirmation dialog opened but no submit control "
+                            "could be found inside it; the report was NOT submitted."
+                        ) from exc
+
+                page.wait_for_timeout(5000)
+                self._take_screenshot(page, "submit_report_final")
+
+                # An unanswered confirmation still on screen means the report
+                # is still in draft. Say so instead of reporting success.
+                if page.locator(self.SUBMIT_CONFIRM_DIALOG).filter(visible=True).count() > 0:
+                    raise RuntimeError(
+                        "Report-totals confirmation dialog is still open after the confirm "
+                        "click; the report was NOT submitted."
+                    )
+
+                # Verify. page.url is not evidence on its own -- the dashboard
+                # URL is the same one we started from.
+                if page.locator("text=Report Successfully Submitted").count() > 0:
+                    logger.info("Report successfully submitted!")
+                    return {"success": True, "message": "Report successfully submitted", "confirmed": confirmed}
+                if confirmed:
+                    logger.info("Confirmation dialog answered and dismissed; report submitted.")
+                    return {"success": True, "message": "Report successfully submitted", "confirmed": True}
+
+                logger.warning("Submit clicked, but submission could not be verified. Check the report in Concur.")
+                return {"success": False, "message": "Submit clicked, but submission could not be verified", "confirmed": False}
 
             except Exception as e:
                 self._take_screenshot(page, "submit_report_error")
