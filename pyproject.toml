@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ccworks"
-version = "0.6.0"
+version = "0.6.1"
 description = "SAP Concur browser-automation and API helper"
 readme = "README.md"
 requires-python = ">=3.10"
