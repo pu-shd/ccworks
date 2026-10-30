@@ -1,0 +1,8 @@
+-r requirements.lock
+ast_serialize==0.13.1
+librt==0.16.0
+mypy==2.4.1
+mypy_extensions==1.1.0
+pathspec==1.1.1
+ruff==0.17.3
+types-requests==2.33.0.20261006

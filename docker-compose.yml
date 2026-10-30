@@ -6,6 +6,12 @@ services:
     container_name: concur-unit-tests
     # Runs the unit tests with mocks (no internet / API keys required)
 
+  extension-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.extension
+    # Lint, type-check, format-check, and exercise extension argument forwarding.
+
   integration-tester:
     build: .
     container_name: concur-integration-tester

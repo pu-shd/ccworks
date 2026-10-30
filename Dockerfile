@@ -1,22 +1,24 @@
-# Keep this tag in step with the `playwright` version pip resolves for the
-# package (see pyproject.toml). When bumping, bump both together.
+# Versioned Playwright environment for OS dependencies; browser binaries for
+# the library pinned in requirements.lock are installed below.
 FROM mcr.microsoft.com/playwright/python:v1.62.0-jammy
 
 WORKDIR /app
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+# The Playwright image includes virtualenv, while its distro Python omits
+# ensurepip (required by `python -m venv`). Use the bundled seed packages.
+RUN python -m virtualenv --no-download "$VIRTUAL_ENV"
 
 # Install the ccworks package (and its declared dependencies) editable so
 # the source tree in /app is directly runnable as a module.
-COPY pyproject.toml README.md LICENSE.md ./
+COPY pyproject.toml README.md LICENSE.md requirements.lock requirements-dev.lock ./
 COPY src/ ./src/
 COPY tests/ ./tests/
-RUN pip install --no-cache-dir -e .
+COPY .pi/extensions/concur.ts ./.pi/extensions/concur.ts
+RUN pip install --no-cache-dir -r requirements-dev.lock -e .
 
-# Safety net for version drift. `playwright` is an open requirement (>=1.44), so
-# pip resolves whatever is newest at build time; when that outruns the base image
-# tag above, the pre-installed browsers sit at a path the new lib does not look
-# in and every test dies with "Executable doesn't exist at /ms-playwright/...".
-# This installs browsers for the version pip actually resolved, and no-ops when
-# they are already present. OS-level deps come from the base image.
+# Install Chromium matching the version pinned by requirements.lock. OS-level
+# dependencies come from the versioned Playwright base image.
 RUN playwright install chromium
 
 # Skip the interactive chromium bootstrap in the container — the base image
@@ -24,4 +26,4 @@ RUN playwright install chromium
 ENV CCWORKS_SKIP_BROWSER_BOOTSTRAP=1
 
 # Default: run the mock unit tests
-CMD ["python", "-m", "unittest", "discover", "-s", "tests"]
+CMD ["python", "-m", "unittest", "discover", "-v", "-s", "tests"]

@@ -23,8 +23,14 @@ jobs:
 
     - name: Install package
       run: |
-        python -m pip install --upgrade pip
-        pip install -e .
+        python -m venv .venv
+        .venv/bin/pip install -r requirements-dev.lock -e .
+
+    - name: Lint, format, and type-check Python
+      run: |
+        .venv/bin/ruff check src tests
+        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py
+        .venv/bin/mypy
 
     - name: Install zsh (the ccworks launcher is a zsh script)
       run: sudo apt-get install -y --no-install-recommends zsh
@@ -37,7 +43,7 @@ jobs:
         CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
       run: |
         # Only run the pure unit tests to avoid Playwright dependency issues
-        python -m unittest tests/test_client.py tests/test_launcher_dispatch.py tests/test_cli_surface.py tests/test_browser_bootstrap.py
+        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login
 
   docker-tests:
     runs-on: ubuntu-latest
@@ -53,6 +59,11 @@ jobs:
     - name: Build and run tests via Docker Compose
       run: |
         docker-compose build unit-tests
+        docker-compose build extension-tests
+        docker-compose run --rm unit-tests ruff check src tests
+        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py
+        docker-compose run --rm unit-tests mypy
+        docker-compose run --rm extension-tests
         docker-compose run --rm unit-tests
 
   browser-smoke-tests:
@@ -67,23 +78,24 @@ jobs:
 
     - name: Install package
       run: |
-        python -m pip install --upgrade pip
-        pip install -e .
+        python -m venv .venv
+        .venv/bin/pip install -r requirements.lock -e .
 
     - name: Install Playwright Chromium with OS Dependencies
       env:
         CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
       run: |
-        python -m playwright install chromium --with-deps
+        .venv/bin/python -m playwright install chromium --with-deps
 
     - name: Run Playwright browser smoke tests
       env:
         # Skip the runtime chromium bootstrap — we just installed it above.
         CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
       run: |
-        python tests/test_browser_smoke.py
-        python tests/test_transaction_fields_crud.py
-        python tests/test_justification.py
+        .venv/bin/python tests/test_browser_smoke.py
+        .venv/bin/python tests/test_transaction_fields_crud.py
+        .venv/bin/python tests/test_justification.py
+        .venv/bin/python -m unittest -v tests.test_session_handoff_browser
 
   package-build:
     runs-on: ubuntu-latest

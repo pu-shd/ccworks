@@ -46,7 +46,7 @@ ensure_venv() {
         python3 -m venv .venv >&2
         source .venv/bin/activate
         pip install --upgrade pip >&2
-        pip install -e . >&2
+        pip install -r requirements.lock -e . >&2
         # Honour the same escape hatch the Python runtime bootstrap uses, so CI
         # and containers that manage browsers themselves skip the ~180 MB
         # chromium download.
@@ -99,7 +99,7 @@ case "$1" in
         python3 -m venv .venv
         source .venv/bin/activate
         pip install --upgrade pip
-        pip install -e .
+        pip install -r requirements.lock -e .
         echo "=== Installing Playwright browser binaries ===" >&2
         playwright install chromium
         echo "Setup complete! Activate using: source .venv/bin/activate" >&2
