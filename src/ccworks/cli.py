@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 # Configure signal handling for graceful exit
 def signal_handler(sig, frame):
     logging.info(f"Signal {sig} received. Cleaning up and exiting...")
-    sys.exit(0)
+    sys.exit(128 + int(sig))
 
 signal.signal(signal.SIGHUP, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
@@ -23,6 +23,7 @@ signal.signal(signal.SIGINT, signal_handler)
 from ccworks import __version__
 from ccworks.client import ConcurClient, ConcurError
 from ccworks.browser_client import ConcurBrowserClient, ConcurSessionExpiredError
+from ccworks.safari_login import run_login
 
 
 def handle_session_expired(e):
@@ -39,7 +40,7 @@ def handle_session_expired(e):
             if choice == 'y':
                 print("\nLaunching browser for login...", file=sys.stderr)
                 client = ConcurBrowserClient()
-                client.run_headed_login()
+                run_login(client, browser=os.environ.get("CCWORKS_LOGIN_BROWSER", "chromium"))
                 print("\n[INFO] Login complete. Resuming your previous command...\n", file=sys.stderr)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
         except (EOFError, KeyboardInterrupt):
@@ -411,7 +412,12 @@ def build_parser():
 
     # ---------------- session ----------------
     session = add_group("session", "Authentication session")
-    session.add_parser("login", help="Launch a headed browser for manual authentication")
+    login = session.add_parser("login", help="Launch a browser and verify saved authentication")
+    login.add_argument("--browser", dest="login_browser", choices=("chromium", "safari", "auto"),
+                       default=None, help="Interactive browser (default: CCWORKS_LOGIN_BROWSER or chromium). "
+                       "Safari and auto are experimental and incomplete for Concur SSO.")
+    login.add_argument("--no-fallback", action="store_true",
+                       help="Fail if Safari cannot export a session usable by Playwright")
     session.add_parser("status", help="Check whether the saved session is still valid")
 
     # ---------------- api ----------------
@@ -671,9 +677,13 @@ def run_tests():
             
             try:
                 browser_client = ConcurBrowserClient()
-                browser_client.run_headed_login()
+                login_result = run_login(
+                    browser_client,
+                    browser=args.login_browser or os.environ.get("CCWORKS_LOGIN_BROWSER", "chromium"),
+                    fallback=not args.no_fallback,
+                )
                 
-                result = {"status": "success", "message": "Manual login setup complete."}
+                result = {"status": "success", "message": "Login and headless session reuse verified.", **login_result}
                 summary = "\n[SUCCESS] Setup complete. You can now run browser-based automations.\nTo create a draft report, use: ccworks report create"
                 output_result(result, summary)
             except ConcurSessionExpiredError as e:

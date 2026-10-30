@@ -1237,7 +1237,9 @@ class ConcurBrowserClient:
             sys.stderr.write("Press ENTER here after you have logged in and see the Concur home page... ")
             sys.stderr.flush()
             # Read from stdin
-            sys.stdin.readline()
+            if not sys.stdin.readline():
+                browser.close()
+                raise EOFError("Login cancelled; no session was saved")
 
             # Save authenticated state with lock
             with self._session_lock():
@@ -1269,6 +1271,18 @@ class ConcurBrowserClient:
             if mins is not None:
                 logger.info(f"Concur JWT captured; valid for {mins:.0f} more minute(s) "
                             f"(until {when}).")
+
+    def verify_session_reuse(self, headless: bool = True) -> None:
+        """Prove saved-state reuse in a fresh context without capturing report data."""
+        from ccworks.safari_login import _require_auth_state
+
+        with self._browser_page(headless=headless) as page:
+            page.goto(f"{self.base_url}/nui/expense", timeout=15000)
+            self._check_session(page)
+            page.locator(
+                ".no-reports, .report-card, .report-tile, .cnqr-report-card, .sapMCard"
+            ).filter(visible=True).first.wait_for(state="visible", timeout=15000)
+            _require_auth_state({"cookies": page.context.cookies()}, self.base_url)
 
     def check_session_validity(self, headless: bool = True) -> Dict[str, Any]:
         """

@@ -13,10 +13,16 @@ dist/
 
 # Local configuration and credentials
 .env
+.env*
+!.env.example
+node_modules/
+*.db
 
 # Session token storage (cookies and local storage state)
 concur_session.json
 concur_session_mock.json
+.login-*/
+.session-*.json
 
 # Screen captures on test completion or failure
 screenshots/
