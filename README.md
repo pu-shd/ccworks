@@ -112,6 +112,7 @@ command's flags.
 | **txn** | `txn update NAME IDX... [--type --purpose --comment --justification]` | Update one or more transactions by 1-based index. |
 | | `txn allocations NAME [--view F]` | List chartstring allocations (Dept, Fund, Program). |
 | | `txn allocate NAME IDX --dept D --fund F [--prog P]` | Add a chartstring to a transaction. Adds; it does not replace — a second allocation splits the expense by percentage. |
+| | `txn allocate-bulk NAME (--all / --indices N...) --dept D --fund F [--prog P] [--dry-run]` | Set a common 100% allocation with native bulk selection; skip verified matches. |
 | | `txn unallocate NAME IDX` | Clear every allocation on a transaction, returning it to the report's default. Use before `txn allocate` to replace a chartstring rather than split it. |
 | | `txn attach-receipt NAME --merchant M --file PATH` | Attach a local receipt file to a transaction row. |
 | **card** | `card list [--view F]` | List credit-card transactions. |
@@ -228,11 +229,31 @@ Allocate last because editing any field on an allocated expense makes Concur ask
 "Update Other Items?" before it will commit — ccworks answers it, but every
 later write then pays for the extra round trip.
 
-For a common chartstring across several expenses, Concur's native selection +
-Allocate dialog can apply one allocation to all selected rows in one operation.
-The CLI still uses its existing per-transaction allocation path. Before reusing
-that optimization, confirm each selected expense, preserve other chartstring
-fields and existing splits, and verify the percentage totals.
+For a common chartstring across several expenses, use the native bulk path:
+
+```bash
+ccworks txn allocate-bulk "Statement Report" --all --dept 25605 --fund A0001 --dry-run
+ccworks txn allocate-bulk "Statement Report" --all --dept 25605 --fund A0001
+ccworks txn allocate-bulk "Statement Report" --indices 1 3 6 --dept 25605 --fund A0001
+```
+
+An explicit `--all` or `--indices` selection is required. `--dry-run` reads and
+validates the selection without saving. Codes must be bare codes, such as
+`25605` and `A0001`. The native SAL allocation dialog must be in Percent mode.
+The per-transaction commands remain available for the legacy UI.
+
+The command checks every selected expense before writing. Existing matching
+100% allocations are skipped; conflicting allocations and splits stop the whole
+preflight without changes. It preserves unrequested chartstring fields, groups
+expenses by those fields, and applies one common allocation per compatible
+group. Omit `--prog` to retain each expense's inherited program.
+
+A fresh browser context verifies saved allocations, percentages, and unchanged
+expense rows. Failed or uncertain writes return a nonzero exit status unless
+readback proves every selected allocation saved correctly. JSON includes
+`updated`, `skipped`, `results`, and `remaining_indices` (all reported indices
+are 1-based). Rerun the same command after reauthentication or interruption:
+it reads state first and skips completed rows, avoiding duplicate splits.
 
 A live six-expense run confirmed that the child Add Allocation Save can persist
 changes before the parent dialog closes. Canceling the parent does not establish
@@ -341,7 +362,7 @@ For local Python checks, install `requirements-dev.lock` into `.venv`, then run:
 .venv/bin/ruff format --check \
   tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py \
   src/ccworks/safari_login.py tests/test_safari_login.py \
-  tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py
+  tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py
 ```
 
 Use `npm ci`, `npm run check`, and `npm test` for local extension checks.

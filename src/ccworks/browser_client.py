@@ -2083,6 +2083,18 @@ class ConcurBrowserClient:
                 logger.error(f"Failed to get allocations: {str(e)}")
                 self._take_screenshot(page, "get_allocations_error")
                 return {"success": False, "error": str(e)}
+    def set_report_allocations(self, report_name, department, fund, program=None,
+                               transaction_indices=None, dry_run=False, headless=True):
+        """Set a common 100% allocation using native bulk selection.
+
+        Indices are zero-based; None selects all expenses. Existing matching
+        allocations are skipped, while conflicting allocations/splits fail the
+        preflight before any write. Other chartstring fields are preserved.
+        """
+        from ccworks.bulk_allocations import BulkAllocator
+        return BulkAllocator(self, report_name, department, fund, program,
+                             transaction_indices, dry_run, headless).run()
+
     ALLOCATION_ADD_BUTTON = ("[data-nuiexp='allocations-addBtn'], "
                              "[data-nuiexp='sal-btn-buttonbar-add']")
     ALLOCATION_REMOVE_BUTTON = ("[data-nuiexp='allocations-removeBtn'], "

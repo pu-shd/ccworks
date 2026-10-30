@@ -140,6 +140,7 @@ _COMMAND_MAP = {
     ("txn", "unallocate"): "unallocate",
     ("txn", "detach-receipt"): "detach-receipt",
     ("txn", "allocate"): "add-allocation",
+    ("txn", "allocate-bulk"): "bulk-allocation",
     ("txn", "attach-receipt"): "attach-receipt",
     ("card", "list"): "list-cards",
     ("card", "show"): "card-details",
@@ -203,6 +204,7 @@ def _command_reference() -> str:
         ("txn update",            "Update transactions by 1-based index [--type --justification ...]"),
         ("txn allocations",       "List chartstring allocations for a report [--view F]"),
         ("txn allocate",          "Add a chartstring to a transaction (--dept --fund [--prog])"),
+        ("txn allocate-bulk",     "Set common 100% allocations (--all | --indices N...) [--dry-run]"),
         ("txn attach-receipt",    "Attach a local receipt file (--merchant --file)"),
         ("card", None),
         ("card list",             "List credit-card transactions [--view F]"),
@@ -362,6 +364,16 @@ def build_parser():
                          help="Fund (e.g. '(A0001) General Fund')")
     t_alloc.add_argument("--prog", type=str, help="Program (e.g. '(P999) Research')")
 
+    t_bulk = txn.add_parser("allocate-bulk", help="Set a common 100% allocation using native bulk selection")
+    t_bulk.add_argument("report_name", help="Name of the expense report")
+    selection = t_bulk.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--all", action="store_true", help="Select every expense in the report")
+    selection.add_argument("--indices", type=int, nargs="+", help="Select these 1-based expense indices")
+    t_bulk.add_argument("--dept", required=True, help="Department code")
+    t_bulk.add_argument("--fund", required=True, help="Fund code")
+    t_bulk.add_argument("--prog", help="Program code; omit to preserve existing defaults")
+    t_bulk.add_argument("--dry-run", action="store_true", help="Read and validate the selection without saving")
+
     t_unalloc = txn.add_parser("unallocate",
                                help="Clear every allocation on a transaction")
     t_unalloc.add_argument("report_name", type=str, help="Name of the expense report")
@@ -508,6 +520,10 @@ def run_tests():
             parser.error("`report delete` needs a report NAME, or --all-drafts to remove every draft")
     if (args.group, sub) == ("receipt", "delete") and not args.all_receipts:
         parser.error("`receipt delete` requires --all (there is no per-receipt delete)")
+
+    if (args.group, sub) == ("txn", "allocate-bulk") and args.indices is not None:
+        if any(i < 1 for i in args.indices) or len(set(args.indices)) != len(args.indices):
+            parser.error("--indices must contain unique positive 1-based indices")
 
     # Normalize the new surface onto the dispatcher's internal command tokens.
     args.command = _legacy_command(args)
@@ -1071,6 +1087,25 @@ def run_tests():
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
                 sys.exit(1)
+
+        elif args.command == "bulk-allocation":
+            try:
+                with Spinner("Checking bulk allocations..."):
+                    browser_client = ConcurBrowserClient()
+                    res = browser_client.set_report_allocations(
+                        report_name=args.report_name,
+                        department=args.dept,
+                        fund=args.fund,
+                        program=args.prog,
+                        transaction_indices=None if args.indices is None else [i - 1 for i in args.indices],
+                        dry_run=args.dry_run,
+                        headless=True,
+                    )
+                output_result(res)
+            except ConcurSessionExpiredError as e:
+                handle_session_expired(e)
+            except Exception:
+                output_result({"success": False, "error": "Bulk allocation failed; inspect saved state before retrying"})
 
         elif args.command == "add-allocation":
             try:
