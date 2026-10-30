@@ -698,5 +698,21 @@ class TestSafariNativeAdapter(unittest.TestCase):
                 wait_for_login()
 
 
+class TestAuthenticationDocumentation(unittest.TestCase):
+    def test_command_reference_keeps_chromium_default_and_safari_experimental(self):
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+        rows = [line for line in readme.splitlines() if line.startswith("|")]
+        default = [line for line in rows if "| `session login` |" in line]
+        experimental = [
+            line for line in rows if "session login --browser safari" in line
+        ]
+        self.assertEqual(1, len(default), "document the normal login command once")
+        self.assertIn("chromium", default[0].lower())
+        self.assertIn("default", default[0].lower())
+        self.assertEqual(1, len(experimental), "list the experimental login separately")
+        self.assertIn("experimental", experimental[0].lower())
+        self.assertIn("incomplete", experimental[0].lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

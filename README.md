@@ -4,7 +4,7 @@ This project provides a unified Python integration client and test suite to veri
 
 It supports two modes of interaction:
 1. **API Integration (Direct)**: Uses SAP Concur REST APIs with OAuth 2.0 Client Credentials authentication (requires API permissions and administrative licensing).
-2. **Browser Automation (Playwright)**: Automates a browser session to perform UI clicks (useful if your organization doesn't have Web Services API access or if direct API keys are unavailable).
+2. **Browser Automation (Playwright Chromium)**: Automates a browser session to perform UI clicks (useful if your organization doesn't have Web Services API access or if direct API keys are unavailable). Chromium is the supported default for manual authentication, saved-session verification, and headless operations. Safari MCP login is an incomplete, experimental development option.
 
 ---
 
@@ -18,7 +18,7 @@ It supports two modes of interaction:
 
 ### For Browser-Based Automation
 1. **Login Credentials**: Standard Concur username/password or SSO login.
-2. **Playwright Setup**: Playwright must be installed locally along with chromium binaries (handled automatically by `./ccworks setup`).
+2. **Playwright Setup**: Playwright must be installed locally along with Chromium binaries (handled automatically by `./ccworks setup`). Chromium is still required when experimenting with Safari login because session verification and subsequent operations use Playwright Chromium.
 
 ---
 
@@ -119,7 +119,8 @@ command's flags.
 | **receipt** | `receipt delete --all` | Delete every available receipt. `--all` is required. |
 | **delegate** | `delegate add WHO [--can prepare submit approve]` | Add an expense delegate (default: `prepare`). |
 | | `delegate remove WHO` | Remove an expense delegate. |
-| **session** | `session login` | Headed browser for manual SSO; saves session state. |
+| **session** | `session login` | Supported default: headed Chromium for manual SSO; verifies and saves session state. |
+| | `session login --browser safari [--no-fallback]` | Incomplete, experimental Safari MCP login for development; falls back to Chromium unless disabled. |
 | | `session status` | Check whether the saved session is still valid. |
 | **api** | `api test` | Run the API client test suite (needs `.env` OAuth creds). |
 | — | `nuke` | Delete ALL draft reports **and** all available receipts. |
@@ -139,6 +140,25 @@ ccworks 0.3.3
 **stdout is data, stderr is diagnostics.** Query commands print JSON on stdout
 while logs, spinners, and session warnings go to stderr, so `2>/dev/null` is
 safe when piping to `jq`.
+
+Write commands exit `1` when an operation or any requested row fails. JSON
+includes the overall `success` flag and individual row results; text output
+also shows failure details. A partially successful batch must be reviewed
+before retrying.
+
+Type-only `txn update` and `report apply-json` batches skip expenses whose type
+already matches exactly. Changed rows reuse the report page after checking the
+editor's vendor, amount, and date; an unverified editor or indistinguishable
+duplicate expenses trigger a fresh navigation. A single final report reload
+verifies saved types. Receipt, text, and allocation updates retain their existing
+navigation and verification paths.
+
+Results include `updated`, `skipped`, and `failed` counts, per-row `saved` and
+`verified` flags for type-only batches, and submission `warnings`. Concur's
+“expense has been saved” warning is a saved draft, not a failed write:
+`success` can be `true` while `ready_to_submit` is `false`. A `null` readiness
+means readiness was not determined. A repeated type-only batch performs no
+saves when every type already matches.
 
 ---
 
@@ -178,6 +198,10 @@ index. Correlate on date + amount.)
 `vendor` and `amount` are the identity guard: `apply-json` refuses a row whose
 amount and vendor do not match what you described, rather than writing to a
 different expense. Omit a field to leave it alone; pass `""` to clear it.
+
+An `allocation` object must include nonempty string `dept` and `fund` values,
+with an optional `prog`. Use `allocation: {}` or `allocation: null` to clear
+allocations. Malformed allocation objects are rejected before any updates are applied.
 
 **3. Correct expense types where they are wrong.** Usually only a few rows.
 Supply the full option text — a bare prefix that matches more than one option is
@@ -249,8 +273,8 @@ and not silently undoable.
     "receipt_path": "/Users/you/receipts/united.pdf" } }
 ```
 
-Unmatched transactions are skipped with a warning on stderr — check those rather
-than assuming full coverage. Merchant matching cannot distinguish rows that
+Unmatched transactions and failed writes are included in the results, fail the
+command, and prevent submission. Merchant matching cannot distinguish rows that
 share a vendor, so prefer `apply-json` with explicit indices where a statement
 repeats a merchant.
 
@@ -283,7 +307,31 @@ The extension is written in TypeScript and is saved at `.pi/extensions/concur.ts
 10. **`concur_remove_delegate(name_or_email)`**: Removes an expense delegate from settings by name or email.
 11. **`concur_nuke_drafts_and_receipts()`**: Deletes all draft reports and available receipts inside Concur (intended for testing cleanup).
 12. **`concur_check_session()`**: Checks whether the currently saved browser session state is active and valid (returns true if authenticated, false if expired or missing).
-13. **`concur_update_transaction(report_name, transaction_index, type, purpose, comment)`**: Updates fields (type, business purpose, comment) of a specific transaction inside an expense report.
+13. **`concur_update_transaction(report_name, transaction_index, type, purpose, comment)`**: Updates fields (type, business purpose, comment) of a specific transaction using a zero-based index. The extension converts it to the CLI's one-based index.
+
+### Development checks
+
+Run the browser and unit suite in Docker, and run extension lint, format, type,
+and argument-forwarding checks in its own container:
+
+```bash
+docker-compose build unit-tests extension-tests
+docker-compose run --rm unit-tests
+docker-compose run --rm extension-tests
+```
+
+For local Python checks, install `requirements-dev.lock` into `.venv`, then run:
+
+```bash
+.venv/bin/ruff check src tests
+.venv/bin/mypy
+.venv/bin/ruff format --check \
+  tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py \
+  src/ccworks/safari_login.py tests/test_safari_login.py \
+  tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py
+```
+
+Use `npm ci`, `npm run check`, and `npm test` for local extension checks.
 
 ### How to Enable
 
@@ -328,8 +376,79 @@ Modern enterprise security often requires MFA or SSO login screens that standard
    ```
 2. A headed Chromium window will open. Enter your email/password, solve SSO if prompted, and complete the MFA authentication.
 3. Once logged in and redirected to the SAP Concur dashboard page, return to your terminal and press **ENTER**.
-4. Your authenticated session token, cookies, and local storage are saved into `concur_session.json`.
+4. The candidate session is checked in two fresh headless Chromium contexts before it atomically replaces your saved session. On macOS the default location is `~/Library/Application Support/ccworks/concur_session.json`. Failed or cancelled login attempts preserve the existing saved session.
 5. Subsequent automated actions will load this file and run headlessly without requiring login or prompt parameters.
+
+**Chromium is the supported default for login and reauthentication.**
+Its live Concur login, headless authentication, and saved-session reuse from a
+separate process have passed validation. Keep `CCWORKS_LOGIN_BROWSER=chromium`
+for routine use.
+
+### Experimental Safari MCP login (incomplete)
+
+Safari 27 on macOS has an **incomplete, experimental** interactive login path
+retained for development. It is not ready for routine Concur SSO. Reevaluate it
+when Safari MCP exposes redirect cookie headers and the live Concur handoff
+passes authentication and saved-session reuse checks:
+
+```bash
+./ccworks session login --browser safari
+./ccworks session login --browser safari --no-fallback
+```
+
+`--browser auto` also tries the experimental Safari path first; it is an explicit
+development opt-in. Developers can set `CCWORKS_LOGIN_BROWSER=safari` (or `auto`)
+to opt in for both login and interactive reauthentication after session expiry. An explicit
+`--browser` overrides the environment variable; invalid values fail immediately.
+All report and expense operations continue through headless Playwright Chromium.
+
+Enable remote automation and external agents in Safari's developer settings, and
+complete any `/usr/bin/safaridriver --enable` authorization locally if macOS
+requires it. ccworks never requests or handles your administrator password.
+On standard macOS accounts, inspect the authorization right with
+`security authorizationdb read com.apple.safaridriver.allow`. Its rules accept
+administrators or members of `_webdeveloper`. A correct password can be rejected
+when the current account belongs to neither group. An administrator can grant
+`_webdeveloper` membership to the account that will run Safari; running `--enable`
+as root alone does not verify that the standard account has that permission.
+
+The manual handoff waits for you to complete SSO/MFA and press ENTER. EOF or
+Ctrl-C cancels without launching the fallback browser. Safari startup and MCP
+requests have timeouts, and owned driver processes are cleaned up on failure.
+
+Safari must expose structured first-party `Set-Cookie` response headers, including
+HttpOnly cookies and their scope, to produce a transferable session. A readable
+`document.cookie` or request `Cookie` header alone is insufficient. Identity-provider
+cookies and storage are excluded from the Safari export. If Safari is unavailable,
+hangs, exposes an unsupported tool schema, redacts authentication headers, or
+produces state Chromium cannot reuse, ccworks opens the existing headed Playwright
+login. `--no-fallback` instead fails and preserves the saved session.
+
+Native Safari 27 has been validated against a local synthetic server: the adapter
+exports an HttpOnly session cookie and Chromium reuses it in fresh contexts.
+Live Concur SSO/MFA handoff did not yield a usable JWT. A controlled Safari 27.0
+redirect test showed that MCP exposed the final response but omitted the redirect's
+issuing `Set-Cookie` header. SSO flows that issue authentication cookies on redirects
+may therefore require the Chromium fallback. Missing cookie scope and expiry are
+never reconstructed from request headers. Portable tests cover MCP transport,
+cross-process reuse, revocation, reauthentication, cancellation, and fallback;
+these checks do not establish that Concur issues transferable cookies in Safari.
+
+Run the portable tests (Safari is never launched):
+
+```bash
+.venv/bin/python -m unittest -v tests.test_safari_login
+docker-compose build unit-tests
+docker-compose run --rm unit-tests python -m unittest -v tests.test_safari_login tests.test_session_handoff_browser
+```
+
+On an authorized macOS host, opt in to the native test. It opens an owned Safari
+fixture tab, exports a synthetic HttpOnly cookie, and verifies it in a separate
+Chromium process with two fresh contexts. It never loads Concur credentials:
+
+```bash
+CCWORKS_TEST_NATIVE_SAFARI=1 .venv/bin/python -m unittest -v tests.test_native_safari_handoff
+```
 
 ---
 
