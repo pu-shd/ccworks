@@ -554,6 +554,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function openAllocations(idx) {
             allocIdx = idx;
             allocDraft = {};
+            const report = reportsData.find(r => r.name === selectedReportName);
+            const sal = !!(report && report.mock_options && report.mock_options.sal_allocations);
+            const modal = document.getElementById('allocations-modal');
+            modal.setAttribute('data-nuiexp', sal ? 'sal-dialog-allocations' : '');
+            let background = document.getElementById('background-allocation-list');
+            if (sal && !background) {
+                background = document.createElement('div');
+                background.id = 'background-allocation-list';
+                background.className = 'sapMListUl';
+                background.textContent = 'Unrelated background list';
+                document.body.prepend(background);
+            }
+            for (const [legacy, current] of [
+                ['allocations-addBtn', 'sal-btn-buttonbar-add'],
+                ['allocations-removeBtn', 'sal-btn-buttonbar-remove'],
+                ['allocation-modal-save', 'sal-btn-allocation-modal-save'],
+                ['Ct-add-btn', 'At-add-btn'],
+            ]) {
+                const button = document.querySelector(`[data-nuiexp="${legacy}"], [data-nuiexp="${current}"]`);
+                if (button) button.setAttribute('data-nuiexp', sal ? current : legacy);
+            }
             toggleRowMenu(idx);
             document.getElementById('add-allocation-form').style.display = 'none';
             document.getElementById('allocations-modal').style.display = 'block';

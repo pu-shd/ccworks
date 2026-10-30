@@ -2083,6 +2083,34 @@ class ConcurBrowserClient:
                 logger.error(f"Failed to get allocations: {str(e)}")
                 self._take_screenshot(page, "get_allocations_error")
                 return {"success": False, "error": str(e)}
+    ALLOCATION_ADD_BUTTON = ("[data-nuiexp='allocations-addBtn'], "
+                             "[data-nuiexp='sal-btn-buttonbar-add']")
+    ALLOCATION_REMOVE_BUTTON = ("[data-nuiexp='allocations-removeBtn'], "
+                                "[data-nuiexp='sal-btn-buttonbar-remove']")
+    ALLOCATION_SAVE_BUTTON = ("[data-nuiexp='allocation-modal-save'], "
+                              "[data-nuiexp='sal-btn-allocation-modal-save']")
+    ALLOCATION_ADD_CONFIRM = "[data-nuiexp='Ct-add-btn'], [data-nuiexp='At-add-btn']"
+
+    def _wait_for_allocations_ready(self, page):
+        """Wait for allocation data or an explicit empty state, never a toolbar."""
+        page.wait_for_function(r"""() => {
+            const visible = e => !!(e && getComputedStyle(e).visibility !== 'hidden' &&
+                (e.getClientRects().length || (getComputedStyle(e).display === 'contents' &&
+                    [...e.children].some(visible))));
+            const roots = [...document.querySelectorAll(
+                "[data-nuiexp='sal-dialog-allocations']")].filter(visible);
+            const root = roots[0] || [...document.querySelectorAll(
+                '.allocation-grid-container, #allocations-list')].find(visible);
+            if (!root) return false;
+            if (/No\s+Allocations|No allocations found/i.test(root.innerText)) return true;
+            return [...root.querySelectorAll('.allocation-row, .sapMLIB, [role="row"]')]
+                .some(row => {
+                    if (!visible(row) || row.querySelector('[role="columnheader"]')) return false;
+                    const text = row.innerText.trim();
+                    return text && !/Default Allocation|Sort column|^Select all rows/.test(text);
+                });
+        }""", timeout=10000)
+
     def _open_allocations_modal(self, page, report_name, transaction_index):
         """Open the Allocations modal for a 0-based transaction index.
 
@@ -2129,7 +2157,7 @@ class ConcurBrowserClient:
                 page.wait_for_timeout(1200)
                 continue
             item.click()
-            page.wait_for_timeout(2000)
+            self._wait_for_allocations_ready(page)
             return row
         raise RuntimeError(last_err)
 
@@ -2141,16 +2169,24 @@ class ConcurBrowserClient:
         expense that has none look allocated -- and makes a failed write verify
         against the very code it failed to change.
         """
+        self._wait_for_allocations_ready(page)
         allocations = []
-        container = page.locator(".allocation-grid-container, #allocations-list, "
-                                 ".sapMListUl").filter(visible=True).first
+        container = page.locator("[data-nuiexp='sal-dialog-allocations']").filter(visible=True).first
+        if container.count() == 0:
+            container = page.locator(".allocation-grid-container, #allocations-list, "
+                                     ".sapMListUl").filter(visible=True).first
         if container.count() == 0:
             return allocations
-        body = (container.text_content() or "")
+        body = container.inner_text()
         if "No Allocations" in body or "No allocations found" in body:
             return allocations
         for r in container.locator(".allocation-row, .sapMLIB, [role='row']").all():
-            text = " ".join((r.text_content() or "").split())
+            # The SAL grid uses display:contents on rows: the row has no box
+            # of its own even while all its cells and inputs are visible.
+            if (not r.is_visible() and r.locator(":visible").count() == 0
+                    or r.locator("[role='columnheader']").count()):
+                continue
+            text = " ".join(r.inner_text().split())
             if not text or "Default Allocation" in text:
                 continue
             # Skip the column-header row: it carries the sort affordances and the
@@ -2158,7 +2194,12 @@ class ConcurBrowserClient:
             # the count and makes a cleared expense look allocated.
             if "Sort column" in text or text.startswith("Select all rows"):
                 continue
-            allocations.append({"raw_text": text})
+            allocation = {"raw_text": text}
+            value = r.locator("input[data-nuiexp='spend-common__amount-input']").first
+            if value.count():
+                allocation["allocation_input"] = value.input_value()
+                allocation["allocation_input_label"] = value.get_attribute("aria-label") or ""
+            allocations.append(allocation)
         if not allocations:
             codes = container.locator(".allocation-code")
             for i in range(codes.count()):
@@ -2202,8 +2243,10 @@ class ConcurBrowserClient:
         if not before:
             return 0, None
 
-        container = page.locator(".allocation-grid-container, #allocations-list, "
-                                 ".sapMListUl").filter(visible=True).first
+        container = page.locator("[data-nuiexp='sal-dialog-allocations']").filter(visible=True).first
+        if container.count() == 0:
+            container = page.locator(".allocation-grid-container, #allocations-list, "
+                                     ".sapMListUl").filter(visible=True).first
         boxes = container.locator("input[type='checkbox']")
         if boxes.count() == 0:
             return 0, "no row checkboxes found in the allocations grid"
@@ -2212,7 +2255,7 @@ class ConcurBrowserClient:
         boxes.nth(0).click(force=True)
         page.wait_for_timeout(600)
 
-        remove = page.locator("[data-nuiexp='allocations-removeBtn']").filter(visible=True).first
+        remove = page.locator(self.ALLOCATION_REMOVE_BUTTON).filter(visible=True).first
         if remove.count() == 0:
             return 0, "Remove button not found in the allocations modal"
         if not remove.is_enabled():
@@ -2233,7 +2276,7 @@ class ConcurBrowserClient:
             confirm.click()
             page.wait_for_timeout(1200)
 
-        save = page.locator("[data-nuiexp='allocation-modal-save']").filter(visible=True).first
+        save = page.locator(self.ALLOCATION_SAVE_BUTTON).filter(visible=True).first
         if save.count() == 0:
             save = page.locator("button:has-text('Save')").filter(visible=True).last
         if save.count() == 0:
@@ -2256,10 +2299,9 @@ class ConcurBrowserClient:
         # Exact selector only. A comma-list including button:has-text('Add')
         # resolves in DOM order and matches the page's "Add Expense" toolbar
         # button, which the modal overlay then blocks.
-        add_btn = page.locator("[data-nuiexp='allocations-addBtn']").filter(visible=True).first
+        add_btn = page.locator(self.ALLOCATION_ADD_BUTTON).filter(visible=True).first
         if add_btn.count() == 0:
-            return [], ("Could not find the Allocations modal 'Add' button "
-                        "([data-nuiexp='allocations-addBtn']).")
+            return [], "Could not find the Allocations modal 'Add' button."
         add_btn.click(force=True)
         page.wait_for_timeout(2000)
 
@@ -2275,7 +2317,7 @@ class ConcurBrowserClient:
             self._take_screenshot(page, "add_allocation_field_error")
             return [], "; ".join(field_errors)
 
-        save_add_btn = page.locator("[data-nuiexp='Ct-add-btn']").filter(visible=True).first
+        save_add_btn = page.locator(self.ALLOCATION_ADD_CONFIRM).filter(visible=True).first
         if save_add_btn.count() == 0:
             save_add_btn = page.locator("button:has-text('Save')").filter(visible=True).last
         if save_add_btn.count() == 0:
@@ -2283,7 +2325,7 @@ class ConcurBrowserClient:
         save_add_btn.click()
         page.wait_for_timeout(2000)
 
-        save_alloc_btn = page.locator("[data-nuiexp='allocation-modal-save']").filter(
+        save_alloc_btn = page.locator(self.ALLOCATION_SAVE_BUTTON).filter(
             visible=True).first
         if save_alloc_btn.count() == 0:
             save_alloc_btn = page.locator("button:has-text('Save')").filter(visible=True).last

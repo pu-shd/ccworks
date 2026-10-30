@@ -228,6 +228,19 @@ Allocate last because editing any field on an allocated expense makes Concur ask
 "Update Other Items?" before it will commit — ccworks answers it, but every
 later write then pays for the extra round trip.
 
+For a common chartstring across several expenses, Concur's native selection +
+Allocate dialog can apply one allocation to all selected rows in one operation.
+The CLI still uses its existing per-transaction allocation path. Before reusing
+that optimization, confirm each selected expense, preserve other chartstring
+fields and existing splits, and verify the percentage totals.
+
+A live six-expense run confirmed that the child Add Allocation Save can persist
+changes before the parent dialog closes. Canceling the parent does not establish
+that the change was rolled back. After a timeout or interrupted dialog, reload
+and read each expense before retrying; adding again can create duplicate splits.
+Allocation readback supports both legacy and SAL controls, waits for data or an
+explicit empty state, and reads visible cells in `display: contents` grid rows.
+
 ### How long a pass takes
 
 Measured against a live 16-row statement, per transaction:
@@ -328,7 +341,7 @@ For local Python checks, install `requirements-dev.lock` into `.venv`, then run:
 .venv/bin/ruff format --check \
   tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py \
   src/ccworks/safari_login.py tests/test_safari_login.py \
-  tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py
+  tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py
 ```
 
 Use `npm ci`, `npm run check`, and `npm test` for local extension checks.
