@@ -23,6 +23,8 @@ import time
 from typing import Any, Sequence
 from urllib.parse import urlsplit
 
+from ccworks import __version__
+
 
 class SafariLoginError(RuntimeError):
     """A sanitized Safari startup, protocol, export, or validation failure."""
@@ -68,7 +70,7 @@ class MCPClient:
                 {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {},
-                    "clientInfo": {"name": "ccworks", "version": "0.6.1"},
+                    "clientInfo": {"name": "ccworks", "version": __version__},
                 },
             )
             if not isinstance(initialized, dict) or initialized.get(
