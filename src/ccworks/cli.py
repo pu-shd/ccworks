@@ -8,6 +8,7 @@ import itertools
 import time
 import logging
 import signal
+from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -170,7 +171,7 @@ def split_incomplete_expenses(expenses, data):
     return safe, withheld
 
 
-def _legacy_command(args) -> str:
+def _legacy_command(args) -> Optional[str]:
     """Map the parsed group/subcommand onto the dispatcher's command token."""
     group = getattr(args, "group", None)
     if group == "nuke":
@@ -180,6 +181,8 @@ def _legacy_command(args) -> str:
         return "list-old-reports" if args.historical else "query"
     if (group, sub) == ("report", "delete"):
         return "delete-all-reports" if args.all_drafts else "delete-report"
+    if group is None or sub is None:
+        return None
     return _COMMAND_MAP.get((group, sub))
 
 
@@ -524,12 +527,23 @@ def run_tests():
         l.propagate = True
 
     def output_result(data, text_summary=None):
+        failed = isinstance(data, dict) and data.get("success") is False
         if args.output == "json":
+            print(json.dumps(data, indent=2))
+        elif failed:
+            print("[FAILED] Operation did not complete successfully.")
             print(json.dumps(data, indent=2))
         elif text_summary:
             print(text_summary)
+            if isinstance(data, dict) and "updated" in data:
+                print(f"Updated: {data['updated']}; unchanged: {data.get('skipped', 0)}; "
+                      f"failed: {data.get('failed', 0)}")
+                for warning in data.get("warnings", []):
+                    print(f"[WARNING] {warning}")
         else:
             print(json.dumps(data, indent=2))
+        if failed:
+            sys.exit(1)
 
     # ----------------------------------------------------
     # Command Dispatcher
@@ -990,13 +1004,14 @@ def run_tests():
                 with Spinner(f"Fetching allocations for '{args.report_name}'..."):
                     browser_client = ConcurBrowserClient()
                     data = browser_client.get_report_allocations(args.report_name, filter_view=args.filter_view, headless=True)
-                    print(json.dumps(data, indent=2))
+                    output_result(data)
             except ConcurSessionExpiredError as e:
 
                 handle_session_expired(e)
 
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
     
         # ----------------------------------------------------
         # Flow J3: Add Allocation
@@ -1022,6 +1037,7 @@ def run_tests():
                 handle_session_expired(e)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
 
         elif args.command == "unallocate":
             try:
@@ -1044,6 +1060,7 @@ def run_tests():
                 handle_session_expired(e)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
 
         elif args.command == "add-allocation":
             try:
@@ -1072,6 +1089,7 @@ def run_tests():
                 handle_session_expired(e)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
     
         # ----------------------------------------------------
         # Flow K: List Card Transactions
@@ -1332,9 +1350,11 @@ def run_tests():
                     )
                 
                 success_count = sum(1 for r in res.get("results", []) if r["success"])
-                summary = f"\n[SUCCESS] Updated {success_count}/{len(tx_indices)} transactions successfully!\n"
+                summary = (f"\n[SUCCESS] Processed {len(tx_indices)} transactions.\n" if "updated" in res
+                           else f"\n[SUCCESS] Updated {success_count}/{len(tx_indices)} transactions successfully!\n")
                 for r in res.get("results", []):
-                    status = "OK" if r["success"] else f"FAILED ({r.get('error')})"
+                    status = (r.get("status", "OK").upper() if r["success"]
+                              else f"FAILED ({r.get('error')})")
                     if r.get("validation_error"):
                         status += f" (WARNING: {r['validation_error']})"
                     elif r.get("note"):
@@ -1454,10 +1474,10 @@ def run_tests():
 
                 if not args.include_incomplete:
                     expenses, withheld = split_incomplete_expenses(expenses, data)
-                    for e in withheld:
+                    for withheld_expense in withheld:
                         print(
-                            f"[SKIP] index {e.get('index')} ({e.get('vendor')} "
-                            f"{e.get('amount')}): captured incompletely "
+                            f"[SKIP] index {withheld_expense.get('index')} ({withheld_expense.get('vendor')} "
+                            f"{withheld_expense.get('amount')}): captured incompletely "
                             f"(deep scan failed), so its fields are not safe to write. "
                             f"Re-run `report show --deep` or pass --include-incomplete.",
                             file=sys.stderr,

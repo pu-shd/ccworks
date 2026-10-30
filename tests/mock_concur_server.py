@@ -397,6 +397,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     row.innerHTML = `
                         <div class="sapMCb" style="width:20px; height:20px; border:1px solid #ccc; margin-right:5px;"></div>
                         <div style="display:none;">Select expense</div>
+                        <span style="display:none;">Merchant: ${t.merchant} |</span>
+                        <span data-nuiexp="expense-type-cell">${t.expense_type || ''}</span>
+                        ${t.date ? `<span>${t.date}</span>` : ''}
                         <div style="width: 120px; font-weight: bold;" class="recon-merchant">${t.merchant} (${t.amount})</div>
                         <div style="display: flex; flex-direction: column; font-size: 11px;">
                             ${t.reconciled ? '<span style="color: green; font-weight: bold;" class="recon-status">✓ Reconciled</span>' : '<span style="color: red;" class="recon-status">Pending</span>'}
@@ -455,8 +458,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const idx = selectedTxIdx;
             const pane = document.getElementById('sapcnqr-layout-side-panel-elements');
             const content = document.getElementById('detail-pane-content');
+            const report = reportsData.find(r => r.name === selectedReportName);
+            if (report && report.mock_options && report.mock_options.sticky_editor
+                    && pane.dataset.rowIdx && pane.dataset.rowIdx !== String(idx)) {
+                pane.style.display = 'block';
+                return; // A previous expense's editor survived closing.
+            }
+            pane.dataset.rowIdx = String(idx);
             
             content.innerHTML = `
+                <input data-nuiexp="field-vendorName" id="vendorName" readonly value="${t.merchant}">
+                <input data-nuiexp="field-transactionAmount" id="transactionAmount" readonly value="${t.amount.replace('$', '')}">
+                ${t.date ? `<input data-nuiexp="field-transactionDate" readonly value="${t.date}">` : ''}
                 <div class="form-group">
                     ${renderExpenseTypeField(t, idx)}
                 </div>
@@ -736,6 +749,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function renderTypeOptions(idx, filter) {
+            const report = reportsData.find(r => r.name === selectedReportName);
+            const delay = report && report.mock_options && report.mock_options.picker_delay_ms;
+            const token = window.__typeQuery = (window.__typeQuery || 0) + 1;
+            if (delay) {
+                setTimeout(() => { if (token === window.__typeQuery) drawTypeOptions(idx, filter); }, delay);
+            } else {
+                drawTypeOptions(idx, filter);
+            }
+        }
+
+        function drawTypeOptions(idx, filter) {
             const box = document.getElementById('type-listbox');
             if (!box) return;
             const q = (filter || '').toLowerCase();
@@ -913,6 +937,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const business_purpose = document.getElementById(`businessPurpose`).value;
             const comment = document.getElementById(`recon-comment`).value;
             const allocation_code = document.getElementById(`recon-allocation-${idx}`).value;
+            const report = reportsData.find(r => r.name === reportName);
+            const opts = (report && report.mock_options) || {};
+            if (opts.save_delay_ms) await new Promise(resolve => setTimeout(resolve, opts.save_delay_ms));
+            if (opts.reject_save) {
+                showSaveDialog('<div>Error</div><div>Before you can continue, you must '
+                    + 'provide valid information for:</div><div>Business Purpose</div>'
+                    + '<button type="button" onclick="closeSaveDialog()">Close</button>');
+                return;
+            }
 
             // Expense type is required. A report named ...REQTYPE enforces it, so
             // the rest of the suite can keep saving rows that have no type.
@@ -964,6 +997,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 showReportDetails(updatedReport);
             }
             delayRowMenus(1800);
+            if (opts.saved_warning) {
+                showSaveDialog('<div>Error</div><div>This expense has been saved, but it is '
+                    + 'missing required information or has an error that needs to be resolved '
+                    + 'before the report can be submitted. Would you like to make corrections now?</div>'
+                    + '<button type="button" onclick="closeSaveDialog()">Yes</button>'
+                    + '<button type="button" onclick="closeSaveDialog(); closeTransactionDetail()">No</button>');
+                return;
+            }
             closeTransactionDetail();
         }
 
@@ -1368,7 +1409,15 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
             # shipments booked the same day for the same amount. ccworks used to
             # deduplicate rows by their text content and silently drop the second.
             # Keyed off the name so existing tests' row counts are unaffected.
-            if "DUPES" in name:
+            if "BATCHTYPES" in name:
+                transactions = [
+                    {"id": f"BATCH-{i}", "merchant": f"Vendor {i}",
+                     "amount": f"${10+i}.00", "date": "06/12/2026",
+                     "expense_type": "Lodging", "business_purpose": "Keep purpose",
+                     "comment": "Keep comment", "allocation_code": "", "reconciled": False}
+                    for i in range(1, 7)
+                ]
+            elif "DUPES" in name:
                 transactions = [
                     {"id": "TX_DUP_1", "merchant": "ESHIPGLOBAL INC", "amount": "$53.77", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False},
                     {"id": "TX_DUP_2", "merchant": "ESHIPGLOBAL INC", "amount": "$53.77", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False},
@@ -1392,12 +1441,15 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
                     {"id": "TX_REP_1", "merchant": "Uber", "amount": "$24.50", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False},
                     {"id": "TX_REP_2", "merchant": "Office Depot", "amount": "$189.99", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False}
                 ]
+            if data.get("mock_options", {}).get("duplicate_identity"):
+                transactions[1].update({key: transactions[0][key] for key in ("merchant", "amount", "date")})
             REPORTS.append({
                 "name": name,
                 "purpose": purpose,
                 "comment": comment,
                 "status": "Draft",
                 "transactions": transactions,
+                "mock_options": data.get("mock_options", {}),
             })
             
             self.send_response(201)
@@ -1412,6 +1464,9 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
                 if r["name"] == report_name:
                     txs = r.get("transactions", [])
                     if 0 <= tx_idx < len(txs):
+                        txs[tx_idx]["save_count"] = txs[tx_idx].get("save_count", 0) + 1
+                        if r.get("mock_options", {}).get("drop_save"):
+                            continue
                         txs[tx_idx]["expense_type"] = data.get("expense_type", "")
                         txs[tx_idx]["business_purpose"] = data.get("business_purpose", "")
                         txs[tx_idx]["comment"] = data.get("comment", "")
