@@ -1,0 +1,8 @@
+FROM node:26.12.1-alpine3.24
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY tsconfig.json eslint.config.mjs ./
+COPY .pi/extensions/concur.ts ./.pi/extensions/concur.ts
+COPY tests/test_extension.mjs ./tests/test_extension.mjs
+CMD ["sh", "-ec", "npm run check && npm test"]

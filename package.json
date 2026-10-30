@@ -1,0 +1,22 @@
+{
+  "name": "ccworks-extension-checks",
+  "private": true,
+  "overrides": {
+    "undici": "8.12.2"
+  },
+  "scripts": {
+    "check": "eslint .pi/extensions/concur.ts tests/test_extension.mjs && tsc --noEmit && prettier --check tests/test_extension.mjs eslint.config.mjs",
+    "test": "node --experimental-vm-modules --test tests/test_extension.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@eslint/js": "10.0.1",
+    "@sinclair/typebox": "0.34.52",
+    "@types/node": "26.6.6",
+    "eslint": "10.13.0",
+    "globals": "17.13.0",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1"
+  }
+}

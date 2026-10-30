@@ -1,12 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export default function (pi: ExtensionAPI) {
   // Helper to find the absolute path of run.sh in the project workspace
@@ -25,13 +25,11 @@ export default function (pi: ExtensionAPI) {
 
   const runCommand = async (args: string[]): Promise<string> => {
     const launcher = getLauncherPath();
-    const cmd = `"${launcher}" ${args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(" ")}`;
-    
     try {
-      const { stdout, stderr } = await execAsync(cmd, { cwd: path.dirname(launcher) });
+      const { stdout, stderr } = await execFileAsync(launcher, args, { cwd: path.dirname(launcher) });
       return stdout + "\n" + stderr;
     } catch (error: any) {
-      const err = new Error(`Execution failed: ${error.message}\nOutput: ${error.stdout || ""}\nError: ${error.stderr || ""}`);
+      const err = new Error(`Execution failed: ${error.message}\nOutput: ${error.stdout || ""}\nError: ${error.stderr || ""}`, { cause: error });
       (err as any).code = error.code;
       throw err;
     }
@@ -132,7 +130,7 @@ export default function (pi: ExtensionAPI) {
       try {
         rulesObj = JSON.parse(params.rules);
       } catch (err: any) {
-        throw new Error(`Invalid JSON rules input: ${err.message}`);
+        throw new Error(`Invalid JSON rules input: ${err.message}`, { cause: err });
       }
 
       // Write rules temporarily to file
@@ -333,13 +331,16 @@ export default function (pi: ExtensionAPI) {
     description: "Updates fields (Expense Type, Business Purpose, and Comments) of an individual transaction inside an expense report, identified by its 0-based index. To remove a comment, pass an empty string.",
     parameters: Type.Object({
       report_name: Type.String({ description: "Name of the expense report containing the transaction" }),
-      transaction_index: Type.Integer({ description: "0-based index of the target transaction row" }),
+      transaction_index: Type.Integer({ minimum: 0, description: "0-based index of the target transaction row" }),
       type: Type.Optional(Type.String({ description: "The Expense Type to apply" })),
       purpose: Type.Optional(Type.String({ description: "The Business Purpose to apply" })),
       comment: Type.Optional(Type.String({ description: "The Comment to apply (pass empty string to clear/delete)" }))
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const args = ["txn", "update", params.report_name, String(params.transaction_index)];
+      if (!Number.isInteger(params.transaction_index) || params.transaction_index < 0) {
+        throw new RangeError("transaction_index must be a non-negative integer");
+      }
+      const args = ["txn", "update", params.report_name, String(params.transaction_index + 1)];
       if (params.type !== undefined) {
         args.push("--type", params.type);
       }
