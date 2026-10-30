@@ -176,6 +176,32 @@ class TestBulkAllocations(unittest.TestCase):
         self.assertEqual([6], result["conflicting_indices"])
         self.assertFalse(self.report().get("allocation_write_count", 0))
 
+    def test_bulk_selection_controls_preserve_row_body_editor_clicks(self):
+        self.seed(
+            transactions=[
+                {
+                    "merchant": "Vendor 1",
+                    "amount": "$11.00",
+                    "expense_type": "Lodging",
+                    "business_purpose": "Keep purpose",
+                    "comment": "Keep comment",
+                }
+            ]
+        )
+        result = self.client.reconcile_report(
+            self.name,
+            {
+                "Vendor 1": {
+                    "expense_type": "Ground Transportation",
+                    "business_purpose": "Keep purpose",
+                }
+            },
+        )
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            "Ground Transportation", self.report()["transactions"][0]["expense_type"]
+        )
+
     def test_dropped_save_never_reports_success(self):
         self.seed(options={"drop_allocation_save": True})
         result = self.apply()

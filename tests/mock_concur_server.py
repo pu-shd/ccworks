@@ -400,7 +400,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                    aria-label="View receipt">&#128220;</button>`
                         : '';
                     row.innerHTML = `
-                        <input type="checkbox" class="expense-select" data-index="${idx}"
+                        <input type="checkbox" class="expense-select sapMCb" data-index="${idx}"
                                onclick="event.stopPropagation()" aria-label="Select expense row ${idx + 1}">
                         <div style="display:none;">Select expense</div>
                         <span style="display:none;">Merchant: ${t.merchant} |</span>
