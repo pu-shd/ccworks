@@ -8,8 +8,9 @@ import unittest
 import urllib.request
 from unittest.mock import patch
 
-from ccworks.browser_client import ConcurBrowserClient
+from ccworks.browser_client import ConcurBrowserClient, ConcurSessionExpiredError
 from ccworks.submission import ReportSubmission
+from ccworks.operation_events import ProgressCheckpoint
 from tests.mock_concur_server import MockConcurServer
 
 os.environ.setdefault("CCWORKS_SKIP_BROWSER_BOOTSTRAP", "1")
@@ -139,3 +140,58 @@ class TestSubmissionResilience(unittest.TestCase):
             self.client.submit_report(self.name[:-8])
         self.assertEqual("Draft", self.report()["status"])
         self.assertEqual(0, self.report().get("submit_count", 0))
+
+    def test_expired_login_before_an_attempt_preserves_the_reauth_signal(self):
+        self.seed()
+        with patch.object(
+            self.client,
+            "_browser_page",
+            side_effect=ConcurSessionExpiredError("expired"),
+        ):
+            with self.assertRaises(ConcurSessionExpiredError):
+                self.client.submit_report(self.name)
+        self.assertEqual(0, self.report().get("submit_count", 0))
+
+    def test_expired_verification_reports_reauth_without_repeating_the_write(self):
+        self.seed()
+        with patch.object(
+            ReportSubmission,
+            "_verify",
+            side_effect=ConcurSessionExpiredError("expired"),
+        ):
+            result = self.client.submit_report(self.name)
+        self.assertFalse(result["success"], result)
+        self.assertEqual("unknown", result["status"])
+        self.assertTrue(result["reauthentication_required"], result)
+        repeated = self.client.submit_report(self.name)
+        self.assertEqual("skipped", repeated["status"])
+        self.assertEqual(1, self.report()["submit_count"])
+
+    def test_checkpoint_failure_before_an_action_blocks_submission(self):
+        self.seed()
+        with patch.object(
+            ProgressCheckpoint, "write", side_effect=OSError("synthetic disk error")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "checkpoint"):
+                self.client.submit_report(self.name)
+        self.assertEqual(0, self.report().get("submit_count", 0))
+
+    def test_checkpoint_failure_after_commit_does_not_prevent_readback(self):
+        self.seed()
+        original = ProgressCheckpoint.write
+        failed = False
+
+        def full_disk(checkpoint, phase, outcome, **kwargs):
+            nonlocal failed
+            if phase == "certification" and outcome == "acknowledged":
+                failed = True
+            if failed:
+                raise OSError("synthetic full disk")
+            return original(checkpoint, phase, outcome, **kwargs)
+
+        with patch.object(ProgressCheckpoint, "write", full_disk):
+            result = self.client.submit_report(self.name)
+        self.assertTrue(result["success"], result)
+        self.assertFalse(result["checkpoint_available"], result)
+        self.assertTrue(result["warnings"], result)
+        self.assertEqual(1, self.report()["submit_count"])

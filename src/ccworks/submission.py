@@ -6,6 +6,7 @@ from typing import Any
 
 from playwright.sync_api import expect
 
+from ccworks.browser_client import ConcurSessionExpiredError
 from ccworks.operation_events import OperationEvents, ProgressCheckpoint
 
 CARDS = ".report-tile, .report-card, .cnqr-report-card, .sapMCard"
@@ -44,10 +45,21 @@ class ReportSubmission:
         self.attempted = False
         self.final_attempted = False
         self.confirmed = False
+        self.reauthentication_required = False
+        self.checkpoint_available = True
 
     def _record(self, phase, outcome):
         self.events.emit(phase, outcome)
-        self.checkpoint.write(phase, outcome, attempted=self.final_attempted)
+        if self.checkpoint_available:
+            try:
+                self.checkpoint.write(phase, outcome, attempted=self.final_attempted)
+            except OSError:
+                self.checkpoint_available = False
+                self.events.emit("checkpoint", "failed")
+
+    def _require_checkpoint(self):
+        if not self.checkpoint_available:
+            raise RuntimeError("Private checkpoint unavailable; submission stopped")
 
     def _card(self, page):
         page.goto(self.client.base_url + "/nui/expense", timeout=30000)
@@ -122,10 +134,19 @@ class ReportSubmission:
             "final_attempted": self.final_attempted,
             "confirmed": self.confirmed,
             "approval_state": state,
+            "reauthentication_required": self.reauthentication_required and not success,
+            "checkpoint_available": self.checkpoint_available,
+            "warnings": []
+            if self.checkpoint_available
+            else [
+                "Private checkpoint could not be updated; use fresh saved-state verification"
+            ],
             "message": "Report submission verified"
             if success
             else "Report remains unsubmitted"
             if state == "draft"
+            else "Session expired; reauthenticate and read saved status before retrying"
+            if self.reauthentication_required
             else "Submission outcome is unknown; read saved status before retrying",
             "events": self.events.events,
         }
@@ -147,6 +168,7 @@ class ReportSubmission:
                     return self._result(before, skipped=True)
                 if before != "draft":
                     return self._result("unknown")
+                self._require_checkpoint()
                 # _state may have opened a header to establish the status.
                 if (
                     page.locator(CARDS)
@@ -167,8 +189,9 @@ class ReportSubmission:
                     raise RuntimeError(
                         "Submit Report is disabled; resolve report alerts"
                     ) from error
-                self.attempted = True
                 self._record("preflight", "attempted")
+                self._require_checkpoint()
+                self.attempted = True
                 toolbar.click(timeout=10000)
                 for _ in range(3):
                     dialog = page.locator(
@@ -199,6 +222,7 @@ class ReportSubmission:
                     expect(action).to_be_enabled(timeout=15000)
                     self.final_attempted = phase != "summary"
                     self._record(phase, "attempted")
+                    self._require_checkpoint()
                     node = dialog.element_handle()
                     action.click(timeout=10000)
                     # The union locator can immediately resolve to the next
@@ -213,10 +237,17 @@ class ReportSubmission:
                         self.confirmed = True
                         break
         except Exception as error:
+            if isinstance(error, ConcurSessionExpiredError):
+                self.reauthentication_required = True
+                self._record("session", "failed")
             if not self.attempted:
                 self._record("completed", "failed")
+                if self.reauthentication_required:
+                    raise ConcurSessionExpiredError(
+                        "Session expired; reauthenticate with ccworks session login"
+                    ) from None
                 if isinstance(error, RuntimeError) and str(error).startswith(
-                    "Submit Report is disabled"
+                    ("Submit Report is disabled", "Private checkpoint unavailable")
                 ):
                     raise
                 raise RuntimeError(
@@ -225,5 +256,8 @@ class ReportSubmission:
             self._record("confirmation", "unknown")
         try:
             return self._result(self._verify())
-        except Exception:
+        except Exception as error:
+            if isinstance(error, ConcurSessionExpiredError):
+                self.reauthentication_required = True
+                self._record("session", "failed")
             return self._result("unknown")

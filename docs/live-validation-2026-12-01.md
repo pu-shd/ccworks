@@ -23,6 +23,9 @@ The first candidate implements the observed submission and recovery failures:
   status as unknown. A repeated invocation checks saved status before acting.
 - Write private, atomic submission checkpoints and emit allowlisted events.
   Legacy browser diagnostics exclude expense text and exception tracebacks.
+- Preserve reauthentication signals. Block submission when its checkpoint
+  cannot be written before an action; if storage fails after submission, still
+  attempt independent readback and report the checkpoint warning.
 - Use the native editor-close control and recognized onboarding/cookie close
   controls. Preserve unknown business dialogs and consent preferences.
 
