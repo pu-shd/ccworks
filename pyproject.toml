@@ -47,6 +47,8 @@ include = [
     "/src",
     "/tests",
     "/release",
+    "/plugins/ccworks",
+    "/.agents/plugins/marketplace.json",
     "/docs/live-validation-2026-12-01.md",
     "/README.md",
     "/LICENSE.md",

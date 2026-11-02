@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ccworks",
+  "version": "0.0.0-dev",
+  "description": "Reconcile SAP Concur statements using the local ccworks CLI. Requires local execution and user authentication."
+}

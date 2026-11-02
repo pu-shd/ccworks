@@ -29,7 +29,7 @@ jobs:
     - name: Lint, format, and type-check Python
       run: |
         .venv/bin/ruff check src tests
-        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py
+        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py tests/test_skill.py
         .venv/bin/mypy
         .venv/bin/python -m ccworks.release_validation
 
@@ -44,7 +44,7 @@ jobs:
         CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
       run: |
         # Only run the pure unit tests to avoid Playwright dependency issues
-        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login tests.test_bulk_allocation_cli tests.test_operation_events tests.test_release_validation
+        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login tests.test_bulk_allocation_cli tests.test_operation_events tests.test_release_validation tests.test_skill
 
   docker-tests:
     runs-on: ubuntu-latest
@@ -62,7 +62,7 @@ jobs:
         docker-compose build unit-tests
         docker-compose build extension-tests
         docker-compose run --rm unit-tests ruff check src tests
-        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py
+        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py tests/test_skill.py
         docker-compose run --rm unit-tests mypy
         docker-compose run --rm unit-tests python -m ccworks.release_validation
         docker-compose run --rm extension-tests
@@ -117,7 +117,7 @@ jobs:
     - name: Exercise native control and recovery mocks on Apple Silicon
       run: |
         set -euo pipefail
-        .venv/bin/python -m unittest -v tests.test_submission_resilience tests.test_submit_confirmation tests.test_ui_readiness tests.test_operation_events tests.test_release_validation
+        .venv/bin/python -m unittest -v tests.test_submission_resilience tests.test_submit_confirmation tests.test_ui_readiness tests.test_operation_events tests.test_release_validation tests.test_skill
 
   package-build:
     runs-on: ubuntu-latest
@@ -133,6 +133,28 @@ jobs:
       run: |
         python -m pip install --upgrade pip build
         python -m build
+
+    - name: Verify the source archive includes the complete skill plugin
+      run: |
+        set -euo pipefail
+        python - <<'PY_SKILL'
+        from pathlib import Path
+        import tarfile
+
+        archives = list(Path("dist").glob("*.tar.gz"))
+        assert len(archives) == 1, "Expected one source archive"
+        expected = [Path(".agents/plugins/marketplace.json")]
+        expected.extend(p for p in Path("plugins/ccworks").rglob("*") if p.is_file())
+        assert len(expected) >= 5, "Skill bundle is missing"
+        with tarfile.open(archives[0]) as archive:
+            members = {m.name.split("/", 1)[1]: m for m in archive.getmembers() if "/" in m.name}
+            for path in expected:
+                member = members.get(path.as_posix())
+                assert member and member.isfile(), f"Missing packaged resource: {path}"
+                with archive.extractfile(member) as resource:
+                    assert resource.read() == path.read_bytes(), f"Stale packaged resource: {path}"
+        print(f"PASS: all {len(expected)} marketplace/skill resources match the source archive")
+        PY_SKILL
 
     - name: Sanity-check installability from sdist
       run: |

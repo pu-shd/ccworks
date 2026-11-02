@@ -1,0 +1,4 @@
+interface:
+  display_name: "ccworks"
+  short_description: "Reconcile Concur statements with verified saves"
+  default_prompt: "Use $ccworks to reconcile my Concur statement with my receipts and allocation instructions."

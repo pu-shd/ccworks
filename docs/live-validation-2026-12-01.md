@@ -28,6 +28,9 @@ The first candidate implements the observed submission and recovery failures:
   attempt independent readback and report the checkpoint warning.
 - Use the native editor-close control and recognized onboarding/cookie close
   controls. Preserve unknown business dialogs and consent preferences.
+- Bundle a reusable ccworks skill for Codex and ChatGPT desktop local Work.
+  The skill guides reconciliation and recovery through the selected CLI; it
+  provides no remote account connector or additional submission authorization.
 
 Remaining changes stay separate so they can have their own failing regressions,
 focused commits, and live acceptance criteria:
@@ -79,6 +82,9 @@ report submission.
    Record the exact clean commit SHA and executable path in private validation
    evidence. The development package can still report 0.7.1; the commit SHA
    identifies the candidate. Do not test one commit and ship another code tree.
+   When exercising the bundled skill, install it from this same checkout and
+   verify its installed resources match `plugins/ccworks`; record which host and
+   skill were used. An older cached plugin does not validate the candidate skill.
 
 2. Check session expiry. If needed, use the development client's Chromium login
    and have the owner complete authentication. Verify saved-session reuse in a
