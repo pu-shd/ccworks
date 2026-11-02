@@ -14,6 +14,7 @@ RUN python -m virtualenv --no-download "$VIRTUAL_ENV"
 COPY pyproject.toml README.md LICENSE.md requirements.lock requirements-dev.lock ./
 COPY src/ ./src/
 COPY tests/ ./tests/
+COPY .github/workflows/ci.yml ./.github/workflows/ci.yml
 COPY release/ ./release/
 COPY plugins/ ./plugins/
 COPY .agents/plugins/marketplace.json ./.agents/plugins/marketplace.json
