@@ -46,6 +46,8 @@ packages = ["src/ccworks"]
 include = [
     "/src",
     "/tests",
+    "/release",
+    "/docs/live-validation-2026-12-01.md",
     "/README.md",
     "/LICENSE.md",
     "/pyproject.toml",

@@ -392,11 +392,18 @@ If you use Pi within this repository, it will automatically discover the extensi
 
 ### Client resilience and event reporting follow-ups
 
+Development candidate and live-validation policy:
+[December 1 validation and release gate](docs/live-validation-2026-12-01.md).
+Development CI is separate from the live test and owner approval required before
+the next version and Homebrew update can ship.
+
 Observed during live reconciliation. The client now waits for actions on the
 supported “Update Other Items” confirmations and accepts “Acknowledge” only for
 the known message that previously modified allocations must be updated manually.
 Browser regressions cover delayed actions and refusing an unknown acknowledgment.
-The broader follow-up work remains:
+The checklist below tracks the broader next-release work; the development
+runbook distinguishes implemented candidate changes from remaining work and
+required live validation:
 
 - Extend confirmation coverage to partially hydrated dialog bodies and nested
   dialog footers. Keep supported actions scoped to the active confirmation and

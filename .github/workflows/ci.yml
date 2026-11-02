@@ -29,8 +29,9 @@ jobs:
     - name: Lint, format, and type-check Python
       run: |
         .venv/bin/ruff check src tests
-        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py
+        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py
         .venv/bin/mypy
+        .venv/bin/python -m ccworks.release_validation
 
     - name: Install zsh (the ccworks launcher is a zsh script)
       run: sudo apt-get install -y --no-install-recommends zsh
@@ -43,7 +44,7 @@ jobs:
         CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
       run: |
         # Only run the pure unit tests to avoid Playwright dependency issues
-        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login tests.test_bulk_allocation_cli
+        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login tests.test_bulk_allocation_cli tests.test_operation_events tests.test_release_validation
 
   docker-tests:
     runs-on: ubuntu-latest
@@ -61,8 +62,9 @@ jobs:
         docker-compose build unit-tests
         docker-compose build extension-tests
         docker-compose run --rm unit-tests ruff check src tests
-        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py
+        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py
         docker-compose run --rm unit-tests mypy
+        docker-compose run --rm unit-tests python -m ccworks.release_validation
         docker-compose run --rm extension-tests
         docker-compose run --rm unit-tests
 
@@ -96,6 +98,26 @@ jobs:
         .venv/bin/python tests/test_transaction_fields_crud.py
         .venv/bin/python tests/test_justification.py
         .venv/bin/python -m unittest -v tests.test_session_handoff_browser
+
+  macos-reliability:
+    runs-on: macos-26
+    env:
+      CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install the locked development environment
+      run: |
+        set -euo pipefail
+        python -m venv .venv
+        .venv/bin/pip install -r requirements-dev.lock -e .
+        .venv/bin/python -m playwright install chromium
+    - name: Exercise native control and recovery mocks on Apple Silicon
+      run: |
+        set -euo pipefail
+        .venv/bin/python -m unittest -v tests.test_submission_resilience tests.test_submit_confirmation tests.test_ui_readiness tests.test_operation_events tests.test_release_validation
 
   package-build:
     runs-on: ubuntu-latest

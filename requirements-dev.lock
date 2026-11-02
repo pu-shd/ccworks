@@ -6,3 +6,4 @@ mypy_extensions==1.1.0
 pathspec==1.1.1
 ruff==0.17.3
 types-requests==2.33.0.20261006
+tzdata==2026.6
