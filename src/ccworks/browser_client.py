@@ -320,10 +320,17 @@ class ConcurBrowserClient:
                     continue
                 text = " ".join((dialog.text_content() or "").split())
                 if "Update Other Items" in text:
-                    choice = dialog.get_by_role("button", name="Do Not Update", exact=True)
-                    if not choice.count():
-                        return False, "save raised 'Update Other Items?' without 'Do Not Update'"
-                    choice.click()
+                    # Previously modified allocations produce an informational
+                    # acknowledgment instead of the propagation question. Both
+                    # variants can render their actions after the dialog body.
+                    acknowledgment = (
+                        "These changes will not overwrite previously modified allocations."
+                        in text and "Update them manually." in text
+                    )
+                    action = "Acknowledge" if acknowledgment else "Do Not Update"
+                    choice = dialog.get_by_role("button", name=action, exact=True)
+                    expect(choice).to_have_count(1, timeout=5000)
+                    choice.click(timeout=5000)
                     page.wait_for_function("el => !el.isConnected || !el.getClientRects().length",
                                            arg=dialog_node, timeout=5000)
                     continue

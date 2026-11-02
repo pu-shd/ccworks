@@ -26,6 +26,8 @@ import threading
 import unittest
 import urllib.request
 
+from playwright.sync_api import sync_playwright
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -147,6 +149,70 @@ class TestUpdateOtherItemsDialog(SaveDialogTestCase):
         self.assertTrue(res["results"][0]["success"], res["results"][0])
         self.assertEqual("no allocation here",
                          self.tx(self.REPORT, 3).get("business_purpose"))
+
+
+class TestAllocationSaveAcknowledgment(unittest.TestCase):
+    """Model the live informational dialog, including asynchronously added actions."""
+
+    def test_delayed_acknowledgment_commits_without_changing_allocations(self):
+        client = ConcurBrowserClient.__new__(ConcurBrowserClient)
+        with sync_playwright() as playwright, playwright.chromium.launch() as browser:
+            page = browser.new_page()
+            page.set_content("""
+                <input data-nuiexp="field-expenseType" value="Software">
+                <button data-nuiexp="exp-save-expense" onclick="showDialog()">Save Expense</button>
+                <script>
+                window.persisted = false;
+                window.allocations = ['existing allocation'];
+                function showDialog() {
+                    const dialog = document.createElement('div');
+                    dialog.setAttribute('role', 'alertdialog');
+                    dialog.innerHTML = `<h2>Update Other Items</h2>
+                        You've updated the following fields: Business Purpose Comment
+                        These changes will not overwrite previously modified allocations.
+                        Update them manually.`;
+                    document.body.appendChild(dialog);
+                    setTimeout(() => {
+                        const action = document.createElement('button');
+                        action.textContent = 'Acknowledge';
+                        action.onclick = () => {
+                            window.persisted = true;
+                            dialog.remove();
+                            document.querySelector('input').remove();
+                        };
+                        dialog.appendChild(action);
+                    }, 250);
+                }
+                </script>
+            """)
+            saved, error = client._click_save_expense(page)
+            self.assertTrue(saved, error)
+            self.assertTrue(page.evaluate('window.persisted'), 'acknowledgment must commit')
+            self.assertEqual(['existing allocation'], page.evaluate('window.allocations'))
+
+    def test_unrecognized_acknowledgment_does_not_authorize_propagation(self):
+        client = ConcurBrowserClient.__new__(ConcurBrowserClient)
+        with sync_playwright() as playwright, playwright.chromium.launch() as browser:
+            page = browser.new_page()
+            page.set_content("""
+                <input data-nuiexp="field-expenseType" value="Software">
+                <button data-nuiexp="exp-save-expense" onclick="showDialog()">Save Expense</button>
+                <script>
+                window.propagated = false;
+                function showDialog() {
+                    const dialog = document.createElement('div');
+                    dialog.setAttribute('role', 'alertdialog');
+                    dialog.innerHTML = `<h2>Update Other Items</h2>
+                        Apply changes to all allocations?
+                        <button onclick="window.propagated = true">Acknowledge</button>`;
+                    document.body.appendChild(dialog);
+                }
+                </script>
+            """)
+            saved, error = client._click_save_expense(page)
+            self.assertFalse(saved, 'an unknown dialog must not be reported as saved')
+            self.assertTrue(error, 'an explicit failure reason is required')
+            self.assertFalse(page.evaluate('window.propagated'), 'do not guess what acknowledgment does')
 
 
 if __name__ == "__main__":
