@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
+# Superseded PR runs are redundant; retain every main-branch validation.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Every job here only reads the repo; nothing publishes, comments, or pushes.
 permissions:
   contents: read
@@ -13,6 +18,7 @@ permissions:
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
 
@@ -29,7 +35,7 @@ jobs:
     - name: Lint, format, and type-check Python
       run: |
         .venv/bin/ruff check src tests
-        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py tests/test_skill.py
+        .venv/bin/ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py tests/test_skill.py tests/run_shard.py tests/test_ci_sharding.py
         .venv/bin/mypy
         .venv/bin/python -m ccworks.release_validation
 
@@ -44,10 +50,16 @@ jobs:
         CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
       run: |
         # Only run the pure unit tests to avoid Playwright dependency issues
-        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login tests.test_bulk_allocation_cli tests.test_operation_events tests.test_release_validation tests.test_skill
+        .venv/bin/python -m unittest -v tests.test_client tests.test_launcher_dispatch tests.test_cli_surface tests.test_browser_bootstrap tests.test_write_failures tests.test_extension tests.test_safari_login tests.test_bulk_allocation_cli tests.test_operation_events tests.test_release_validation tests.test_skill tests.test_ci_sharding
 
-  docker-tests:
+  docker-test-shards:
+    name: Docker shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
     - uses: actions/checkout@v4
 
@@ -57,19 +69,48 @@ jobs:
           sudo ln -s /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
         fi
 
-    - name: Build and run tests via Docker Compose
+    - name: Build the test container
+      run: docker-compose build unit-tests
+
+    - name: Container lint, types, and extension checks
+      if: matrix.shard == 0
       run: |
-        docker-compose build unit-tests
+        set -euo pipefail
         docker-compose build extension-tests
         docker-compose run --rm unit-tests ruff check src tests
-        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py tests/test_skill.py
+        docker-compose run --rm unit-tests ruff format --check tests/test_write_failures.py tests/test_extension.py tests/test_type_updates.py src/ccworks/safari_login.py tests/test_safari_login.py tests/test_session_handoff_browser.py tests/test_native_safari_handoff.py tests/test_allocation_resilience.py src/ccworks/bulk_allocations.py tests/test_bulk_allocations.py tests/test_bulk_allocation_cli.py src/ccworks/submission.py src/ccworks/operation_events.py src/ccworks/release_validation.py tests/test_submission_resilience.py tests/test_operation_events.py tests/test_release_validation.py tests/test_ui_readiness.py tests/test_skill.py tests/run_shard.py tests/test_ci_sharding.py
         docker-compose run --rm unit-tests mypy
         docker-compose run --rm unit-tests python -m ccworks.release_validation
         docker-compose run --rm extension-tests
-        docker-compose run --rm unit-tests
+
+    - name: Run this partition of the complete suite
+      env:
+        TEST_SHARD: ${{ matrix.shard }}
+      run: |
+        set -euo pipefail
+        docker-compose run --rm unit-tests python -m tests.run_shard --index "$TEST_SHARD" --count 4
+
+  # Preserve the existing required-check name and fail on any incomplete shard.
+  docker-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [docker-test-shards]
+    if: ${{ always() }}
+    steps:
+    - name: Require every Docker shard
+      env:
+        SHARD_RESULT: ${{ needs.docker-test-shards.result }}
+      run: |
+        set -euo pipefail
+        if [[ "$SHARD_RESULT" != success ]]; then
+          echo "FAIL: Docker shards did not all succeed ($SHARD_RESULT)"
+          exit 1
+        fi
+        echo "PASS: all four Docker shards completed successfully"
 
   browser-smoke-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
 
@@ -101,6 +142,7 @@ jobs:
 
   macos-reliability:
     runs-on: macos-26
+    timeout-minutes: 10
     env:
       CCWORKS_SKIP_BROWSER_BOOTSTRAP: "1"
     steps:
@@ -117,10 +159,11 @@ jobs:
     - name: Exercise native control and recovery mocks on Apple Silicon
       run: |
         set -euo pipefail
-        .venv/bin/python -m unittest -v tests.test_submission_resilience tests.test_submit_confirmation tests.test_ui_readiness tests.test_operation_events tests.test_release_validation tests.test_skill
+        .venv/bin/python -m unittest -v tests.test_submission_resilience tests.test_submit_confirmation tests.test_ui_readiness tests.test_operation_events tests.test_release_validation tests.test_skill tests.test_ci_sharding
 
   package-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
 

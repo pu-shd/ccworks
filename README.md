@@ -506,6 +506,31 @@ This project includes a fully automated **GitHub Actions CI/CD Pipeline** define
 2. **Containerized Unit Tests**: Builds and executes mock unit tests inside a Docker container using `docker-compose`.
 3. **End-to-End Browser Smoke & Regression Tests**: Launches a stateful mock server and runs headless Playwright tests, including full CRUD and justification/classification regression suites.
 
+The container suite runs in four parallel groups. Entire modules stay together
+to preserve ordered fixtures; CI timing hints balance the expensive allocation
+and receipt tests. All discovered cases remain covered exactly once across the
+groups, checked by `tests.test_ci_sharding`. New test modules are discovered
+automatically. Each group prints its test count, skips, elapsed time, and explicit
+PASS/FAIL; empty groups and import failures cannot report success.
+
+The existing `docker-tests` status requires all four groups to pass. Container
+lint, format, type, release-schema and extension checks run once, alongside the
+separate host, Apple Silicon, browser and packaging jobs. Superseded PR runs are
+canceled; main-branch runs have distinct concurrency groups. Job timeouts bound
+stalled runs. Scheduling uses measured hints rather than changing browser
+timeouts or disabling regressions.
+
+To inspect or run one group locally:
+
+```zsh
+.venv/bin/python -m tests.run_shard --index 0 --count 4 --list
+docker-compose run --rm unit-tests python -m tests.run_shard --index 0 --count 4
+```
+
+Indices are 0–3. The ordinary `docker-compose run --rm unit-tests` command still
+runs the entire suite serially. CI runtime depends on runner availability and
+the slowest group; rebalance timing hints when test costs change.
+
 ---
 
 ## 🔒 Handling Multi-Factor Authentication (MFA) & SSO in Browser Mode

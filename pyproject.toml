@@ -46,6 +46,7 @@ packages = ["src/ccworks"]
 include = [
     "/src",
     "/tests",
+    "/.github/workflows/ci.yml",
     "/release",
     "/plugins/ccworks",
     "/.agents/plugins/marketplace.json",
@@ -69,4 +70,4 @@ select = ["E9", "F63", "F7", "F82"]
 
 [tool.mypy]
 python_version = "3.10"
-files = ["src/ccworks"]
+files = ["src/ccworks", "tests/run_shard.py"]
