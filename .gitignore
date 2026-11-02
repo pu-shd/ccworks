@@ -23,6 +23,7 @@ concur_session.json
 concur_session_mock.json
 .login-*/
 .session-*.json
+.ccworks-state/
 
 # Screen captures on test completion or failure
 screenshots/
