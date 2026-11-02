@@ -300,6 +300,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 card.innerHTML = `
                     <div class="report-info">
                         <span class="report-name">${r.name}</span>
+                        <span class="report-status">${r.status || 'Draft'}</span>
                         <span class="report-purpose">(${r.purpose || 'No Purpose'})</span>
                         <p style="margin: 5px 0 0 0; font-size:12px; color:#5c646b;">Comment: ${r.comment || 'None'}</p>
                     </div>
@@ -310,6 +311,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         `}
                     </div>
                 `;
+                if ((r.mock_options || {}).status_delay_ms) {
+                    const status = card.querySelector('.report-status');
+                    status.textContent = 'Loading';
+                    setTimeout(() => status.textContent = r.status || 'Draft', r.mock_options.status_delay_ms);
+                }
                 container.appendChild(card);
             });
         }
@@ -1091,6 +1097,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             // made a page-wide .first locator resolve to the covered button
             // and time out.
             const reportName = selectedReportName;
+            const report = reportsData.find(r => r.name === reportName);
+            const options = (report && report.mock_options) || {};
+            if (options.native_submit_flow) {
+                showNativeSubmitDialog(reportName, false);
+                return;
+            }
 
             const overlay = document.createElement('div');
             overlay.id = 'report-totals-overlay';
@@ -1131,6 +1143,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             dialog.appendChild(cancelBtn);
             overlay.appendChild(dialog);
             document.body.appendChild(overlay);
+        }
+
+        function showNativeSubmitDialog(reportName, agreement) {
+            const report = reportsData.find(r => r.name === reportName);
+            const options = (report && report.mock_options) || {};
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:#7778;z-index:9500;display:grid;place-items:center';
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'dialog');
+            dialog.setAttribute('aria-modal', 'true');
+            dialog.setAttribute('data-nuiexp', agreement
+                ? 'exp-dlg-confirmation-agreement-modal' : 'erp-dlg-report-summary');
+            dialog.style.cssText = 'background:white;padding:30px';
+            dialog.innerHTML = agreement
+                ? '<h3>User Submit</h3><p>I certify this is a true and accurate accounting of expenses. All required receipt images have been attached.</p>'
+                : '<h3>Report Summary</h3><p>Review the report before proceeding.</p>';
+            const cancel = document.createElement('button');
+            cancel.textContent = 'Cancel';
+            cancel.onclick = () => overlay.remove();
+            dialog.appendChild(cancel);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+            setTimeout(() => {
+                const action = document.createElement('button');
+                action.textContent = agreement ? 'Accept & Submit' : 'Proceed';
+                action.setAttribute('data-nuiexp', agreement
+                    ? 'accept-and-create-button' : 'erp-btn-summary-footer-submit');
+                action.onclick = async () => {
+                    if (!agreement) {
+                        overlay.remove();
+                        showNativeSubmitDialog(reportName, true);
+                        return;
+                    }
+                    if (!options.drop_submission) {
+                        await fetch('/api/reports/submit', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({report_name: reportName})
+                        });
+                    }
+                    overlay.remove();
+                    if (options.lose_submit_ack) {
+                        location.reload();
+                        return;
+                    }
+                    closeReportDetails();
+                    await fetchReports();
+                };
+                dialog.appendChild(action);
+            }, options.submit_action_delay_ms || 0);
         }
 
         function closeReportDetails() {
@@ -1580,6 +1641,7 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
             for r in REPORTS:
                 if r["name"] == report_name:
                     r["status"] = "Submitted"
+                    r["submit_count"] = r.get("submit_count", 0) + 1
             
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

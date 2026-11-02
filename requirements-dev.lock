@@ -4,5 +4,7 @@ librt==0.16.0
 mypy==2.4.1
 mypy_extensions==1.1.0
 pathspec==1.1.1
+PyYAML==6.0.3
 ruff==0.17.3
 types-requests==2.33.0.20261006
+tzdata==2026.6

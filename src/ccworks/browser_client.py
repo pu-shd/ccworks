@@ -12,10 +12,12 @@ from playwright.sync_api import sync_playwright, expect, TimeoutError as Playwri
 
 from ccworks import paths
 from ccworks.browser_bootstrap import ensure_chromium
+from ccworks.operation_events import RedactedBrowserDiagnostics
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ConcurBrowserClient")
+logger.addFilter(RedactedBrowserDiagnostics())
 
 
 class ConcurSessionExpiredError(RuntimeError):
@@ -213,14 +215,8 @@ class ConcurBrowserClient:
                           "[data-nuiexp='receipt-body'], "
                           "[data-nuiexp='receipt-viewer-metadata'], #upload-receipt-button")
 
-    # Submitting is two clicks. The toolbar button opens a report-totals
-    # confirmation rendered as a full-screen overlay; the report is not
-    # submitted until the dialog's own button is clicked. The toolbar button
-    # stays in the DOM behind the overlay and still matches
-    # button:has-text('Submit Report'), so a page-wide locator taking .first
-    # resolves to the covered button and times out against the overlay
-    # ("subtree intercepts pointer events") while the report stays in draft.
-    # The confirmation must be scoped to inside the dialog.
+    # Legacy confirmation selectors. The current native summary/certification
+    # stages and independent status verification live in ccworks.submission.
     SUBMIT_CONFIRM_DIALOG = ("[data-nuiexp='report-totals-modal'], "
                              ".report-totals-modal, "
                              "[role='dialog'][aria-modal='true']")
@@ -275,15 +271,20 @@ class ConcurBrowserClient:
             return True
         pane = page.locator(self.EXPENSE_PANE).filter(visible=True).first
         scope = pane if pane.count() else page
+        native_close = page.locator("[data-nuiexp='close-full-screen-panel']").filter(visible=True)
         cancel = scope.get_by_role("button", name=re.compile(r"^(Cancel|Close)$", re.I)).first
         try:
-            if cancel.count():
+            if native_close.count() == 1:
+                native_close.click(timeout=3000)
+            elif native_close.count() > 1:
+                return False
+            elif cancel.count():
                 cancel.click(timeout=3000)
             else:
-                page.keyboard.press("Escape")
+                return False
             expect(fields).to_have_count(0, timeout=3000)
             return True
-        except PlaywrightTimeoutError:
+        except (PlaywrightTimeoutError, AssertionError):
             return False
 
     def _click_save_expense(self, page, ctx=None, warnings=None):
@@ -1008,46 +1009,34 @@ class ConcurBrowserClient:
         except Exception as e:
             return f"receipt removal failed on row {idx}: {e}"
 
-    def _dismiss_modals(self, page):
-        """Aggressively dismisses common SAP Concur overlays."""
-        # 1. Timeline Modal / What's New
-        modals = page.locator("[data-nuiexp='timelineModal'], .sapcnqr-dialog__fade--in, [role='dialog'][aria-modal='true']").filter(visible=True)
-        if modals.count() > 0:
-            logger.info(f"Detected {modals.count()} visible modal(s). Attempting dismissal...")
-            
-            # Try Escape key first
-            page.keyboard.press("Escape")
-            if modals.count() == 0:
-                return
-            
-            # Try finding a Close/X button
-            close_buttons = [
-                "button:has-text('Close')", 
-                ".sapMBtn:has-text('Close')", 
-                "button[aria-label='Close']",
-                ".sapcnqr-icon--close"
-            ]
-            for selector in close_buttons:
-                btn = page.locator(selector).filter(visible=True).first
-                if btn.count() > 0:
-                    try:
-                        btn.click(force=True, timeout=2000)
-                        expect(modals).to_have_count(0, timeout=2000)
-                        return
-                    except Exception:
-                        pass
+    def _close_cookie_banner(self, page):
+        """Activate the site's normal close control without changing consent."""
+        overlay = page.locator("#trustarc-banner-overlay")
+        if not overlay.is_visible():
+            return
+        close = page.locator("#truste-consent-close")
+        expect(close).to_have_count(1, timeout=5000)
+        # The live close link can be outside the viewport. Activate that exact
+        # control; do not remove overlays or change preference/consent buttons.
+        close.evaluate("element => element.click()")
+        overlay.wait_for(state="hidden", timeout=5000)
+        from ccworks.operation_events import OperationEvents
+        OperationEvents("browser").emit("overlay", "handled")
 
-            # 2. Nuclear Option: Remove from DOM if still present
-            logger.info("Nuclear dismissal: removing modals from DOM via evaluate...")
-            page.evaluate("""
-                document.querySelectorAll("[data-nuiexp='timelineModal'], .sapcnqr-dialog, [role='dialog'][aria-modal='true']").forEach(el => {
-                    el.style.display = 'none';
-                    el.remove();
-                });
-                document.querySelectorAll(".sapMDialog").forEach(el => el.remove());
-                document.body.classList.remove("sapMDialog-Open");
-            """)
-            expect(modals).to_have_count(0, timeout=2000)
+    def _dismiss_modals(self, page):
+        """Close only recognized onboarding overlays, preserving business dialogs."""
+        known = page.locator("[data-nuiexp='timelineModal'], "
+                             ".vip-widgets__text-app-onboarding-dialog").filter(visible=True)
+        for root in reversed(known.all()):
+            close = root.get_by_role("button", name=re.compile(r"^(Close|Dismiss|Got it)$", re.I)).first
+            if close.count():
+                node = root.element_handle()
+                close.click(timeout=3000)
+                page.wait_for_function(
+                    "el => !el.isConnected || !el.getClientRects().length",
+                    arg=node, timeout=3000,
+                )
+        self._close_cookie_banner(page)
 
     @contextlib.contextmanager
     def _session_lock(self):
@@ -1096,6 +1085,10 @@ class ConcurBrowserClient:
                 viewport={"width": 1280, "height": viewport_height},
             )
             page = context.new_page()
+            page.add_locator_handler(
+                page.locator("#trustarc-banner-overlay"),
+                lambda: self._close_cookie_banner(page),
+            )
             try:
                 yield page
             except ConcurSessionExpiredError:
@@ -4364,127 +4357,29 @@ class ConcurBrowserClient:
                 self._take_screenshot(page, "attach_receipt_error")
                 raise e
     def submit_report(self, report_name: str, headless: bool = True) -> Dict[str, Any]:
-        """
-        Locates an expense report by name, opens it, and clicks the 'Submit Report' button.
-        Handles the confirmation dialog that typically follows.
-        """
-        logger.info(f"Submitting report '{report_name}' via browser (headless={headless})...")
-        with self._browser_page(headless=headless) as page:
-            try:
-                page.goto(f"{self.base_url}/nui/expense", timeout=30000)
-                self._wait_for_dashboard(page)
-                self._take_screenshot(page, "submit_report_start")
+        """Submit through known UI stages and independently verify persisted status."""
+        from ccworks.submission import ReportSubmission
 
-                # Locate and open the report
-                card = page.locator(".report-tile, .report-card").filter(has_text=report_name).first
-                if card.count() == 0:
-                    card = page.locator(".sapMCard, .sapMLIB").filter(has_text=report_name).first
-                
-                if card.count() == 0:
-                    raise FileNotFoundError(f"Could not find report '{report_name}'.")
-
-                card.click()
-                page.wait_for_timeout(3000)
-                self._wait_for_report_view(page)
-                self._take_screenshot(page, "submit_report_opened")
-
-                # A leftover timeline / What's New overlay intercepts pointer
-                # events on the report view, so clear it before reaching for
-                # the toolbar button.
-                self._dismiss_modals(page)
-
-                # Click Submit Report
-                # The button ID #submit-entire-report-btn is often used in the modern UI
-                submit_btn = page.locator("#submit-entire-report-btn, button:has-text('Submit Report')").filter(visible=True).first
-
-                if submit_btn.count() == 0:
-                    raise RuntimeError("Submit Report button not found on this page.")
-                if not submit_btn.is_enabled():
-                    raise RuntimeError("Submit Report button is disabled. Ensure all alerts are resolved and justifications are filled.")
-
-                # Register dialog accept handler for native confirm()/alert()
-                page.on("dialog", lambda dialog: dialog.accept())
-
-                submit_btn.click()
-                logger.info("Clicked 'Submit Report' button.")
-
-                # The report-totals confirmation is where submission actually
-                # happens. Scope the click to inside the dialog: the toolbar
-                # button behind the overlay still matches the same text and is
-                # unclickable, so a page-wide .first would time out here and
-                # leave the report in draft.
-                confirmed = False
-                dialog = page.locator(self.SUBMIT_CONFIRM_DIALOG).filter(visible=True).first
-                try:
-                    dialog.wait_for(state="visible", timeout=15000)
-                except PlaywrightTimeoutError:
-                    logger.info("No report-totals confirmation appeared; treating the first click as the submit.")
-                else:
-                    self._take_screenshot(page, "submit_report_totals_dialog")
-                    confirm_btn = dialog.locator(self.SUBMIT_CONFIRM_BUTTON).filter(visible=True).first
-                    try:
-                        confirm_btn.wait_for(state="visible", timeout=10000)
-                        confirm_btn.click()
-                        confirmed = True
-                        logger.info("Clicked 'Submit Report' inside the report-totals confirmation.")
-                    except PlaywrightTimeoutError as exc:
-                        raise RuntimeError(
-                            "Report-totals confirmation dialog opened but no submit control "
-                            "could be found inside it; the report was NOT submitted."
-                        ) from exc
-
-                page.wait_for_timeout(5000)
-                self._take_screenshot(page, "submit_report_final")
-
-                # An unanswered confirmation still on screen means the report
-                # is still in draft. Say so instead of reporting success.
-                if page.locator(self.SUBMIT_CONFIRM_DIALOG).filter(visible=True).count() > 0:
-                    raise RuntimeError(
-                        "Report-totals confirmation dialog is still open after the confirm "
-                        "click; the report was NOT submitted."
-                    )
-
-                # Verify. page.url is not evidence on its own -- the dashboard
-                # URL is the same one we started from.
-                if page.locator("text=Report Successfully Submitted").count() > 0:
-                    logger.info("Report successfully submitted!")
-                    return {"success": True, "message": "Report successfully submitted", "confirmed": confirmed}
-                if confirmed:
-                    logger.info("Confirmation dialog answered and dismissed; report submitted.")
-                    return {"success": True, "message": "Report successfully submitted", "confirmed": True}
-
-                logger.warning("Submit clicked, but submission could not be verified. Check the report in Concur.")
-                return {"success": False, "message": "Submit clicked, but submission could not be verified", "confirmed": False}
-
-            except Exception as e:
-                self._take_screenshot(page, "submit_report_error")
-                logger.error(f"Failed to submit report: {str(e)}")
-                raise e
+        return ReportSubmission(self, report_name, headless).run()
     # --- Private Helpers ---
 
-    def _open_report_by_name(self, page: Any, name: str, settle: bool = True) -> None:
-        """Helper to find and open a report card by name."""
-        logger.info(f"Opening report '{name}'...")
-        
-        # Wait for content to load
+    def _named_report_cards(self, page, name):
+        """Preserve selector priority so a containing list row is not a report card."""
+        selectors = (".report-tile", ".report-card", ".sapMCard", ".sapMLIB", ".cnqr-report-card")
+        ready = page.locator(", ".join(selectors)).filter(has_text=name).filter(visible=True).first
         try:
-            page.locator(".report-tile, .report-card, .sapMCard, .sapMLIB, .cnqr-report-card, .no-reports").filter(visible=True).first.wait_for(state="visible", timeout=15000)
-        except Exception:
-            pass
+            ready.wait_for(state="visible", timeout=15000)
+        except PlaywrightTimeoutError as error:
+            raise FileNotFoundError("Requested report was not available on the dashboard") from error
+        for selector in selectors:
+            cards = page.locator(selector).filter(has_text=name).filter(visible=True)
+            if cards.count():
+                return cards
+        raise FileNotFoundError("Requested report was no longer available")
 
-        card_selectors = [".report-tile", ".report-card", ".sapMCard", ".sapMLIB", ".cnqr-report-card"]
-        card = None
-        for selector in card_selectors:
-            loc = page.locator(selector).filter(has_text=name)
-            if loc.count() > 0:
-                card = loc.first
-                break
-        
-        if not card:
-            if page.locator(".no-reports").is_visible():
-                raise FileNotFoundError(f"Dashboard is empty (No reports found). Could not find '{name}'.")
-            raise FileNotFoundError(f"Could not find report '{name}'.")
-
+    def _open_report_by_name(self, page: Any, name: str, settle: bool = True) -> None:
+        """Wait for the requested name, rather than the first loading placeholder."""
+        card = self._named_report_cards(page, name).first
         card.click()
         if settle:
             page.wait_for_timeout(3000)

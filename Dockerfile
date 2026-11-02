@@ -14,6 +14,9 @@ RUN python -m virtualenv --no-download "$VIRTUAL_ENV"
 COPY pyproject.toml README.md LICENSE.md requirements.lock requirements-dev.lock ./
 COPY src/ ./src/
 COPY tests/ ./tests/
+COPY release/ ./release/
+COPY plugins/ ./plugins/
+COPY .agents/plugins/marketplace.json ./.agents/plugins/marketplace.json
 COPY .pi/extensions/concur.ts ./.pi/extensions/concur.ts
 RUN pip install --no-cache-dir -r requirements-dev.lock -e .
 

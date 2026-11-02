@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "eligible_from": "2026-12-01",
+  "status": "pending",
+  "candidate_commit": null,
+  "validated_at": null,
+  "approved_for_release": false,
+  "checks": {
+    "session_reuse": false,
+    "fields_receipts_allocations": false,
+    "rerun_without_duplicates": false,
+    "three_stage_submission": false,
+    "independent_submitted_status": false,
+    "redacted_events": false
+  }
+}

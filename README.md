@@ -48,6 +48,58 @@ cd ccworks
 ./ccworks setup       # creates .venv, `pip install -e .`, installs chromium
 ```
 
+### Codex and ChatGPT skill
+
+The development branch includes a portable
+[ccworks skill](plugins/ccworks/skills/ccworks/SKILL.md) and a local plugin
+marketplace. The skill covers receipt matching, exact justifications, bulk
+allocations, reauthentication, independent readback, and approved submission.
+It uses your selected `ccworks` executable; installing the skill does not install
+or upgrade the client. The plugin is an unpublished development package.
+
+From this checkout, register and install it with a current Codex CLI:
+
+```zsh
+codex plugin marketplace add .
+codex plugin add ccworks@ccworks-local
+```
+
+Start a new Codex session and select the skill with `$` or `/skills`. For a
+standalone installation through `$skill-installer`, use this repository's
+`plugins/ccworks/skills/ccworks` directory at the desired Git ref instead.
+Choose one installation method to avoid duplicate skill entries.
+
+In the ChatGPT desktop app, restart after registering the marketplace, open the
+Plugins Directory, choose **ccworks development**, and install **ccworks** if it
+is not already installed. In a new local Work session, select the ccworks skill
+with `@`. Availability depends on your workspace's plugin policy. The package
+follows the official [skill](https://learn.chatgpt.com/docs/build-skills) and
+[local plugin marketplace](https://developers.openai.com/plugins/build/plugins)
+formats.
+
+Example request: “Use ccworks to inspect my latest statement, match the receipts
+in the directory I provide, and apply these allocation and justification
+instructions. Leave the report ready for my approval.”
+
+Execution requires local shell access, an installed ccworks client, Chromium,
+and user-completed Concur SSO/MFA. This skill supplies workflow guidance; it does
+not expose your computer or saved session to ordinary ChatGPT web/mobile chat,
+and it includes no remote MCP connector. Without those execution capabilities,
+the skill can help plan work but cannot perform account operations.
+
+Validate the skill offline, without opening Concur:
+
+```zsh
+.venv/bin/python -m unittest -v tests.test_skill
+docker-compose build unit-tests
+docker-compose run --rm unit-tests python -m unittest -v tests.test_skill
+```
+
+The tests validate bundle discovery, metadata, relative references, real CLI
+argument parsing, and guarded JSON dispatch using a mocked client. They do not
+establish that a model will follow every instruction or that production
+reconciliation passes. December live validation remains required.
+
 ### One command surface
 
 `ccworks` exposes a single set of commands, grouped by resource as
@@ -392,11 +444,18 @@ If you use Pi within this repository, it will automatically discover the extensi
 
 ### Client resilience and event reporting follow-ups
 
+Development candidate and live-validation policy:
+[December 1 validation and release gate](docs/live-validation-2026-12-01.md).
+Development CI is separate from the live test and owner approval required before
+the next version and Homebrew update can ship.
+
 Observed during live reconciliation. The client now waits for actions on the
 supported “Update Other Items” confirmations and accepts “Acknowledge” only for
 the known message that previously modified allocations must be updated manually.
 Browser regressions cover delayed actions and refusing an unknown acknowledgment.
-The broader follow-up work remains:
+The checklist below tracks the broader next-release work; the development
+runbook distinguishes implemented candidate changes from remaining work and
+required live validation:
 
 - Extend confirmation coverage to partially hydrated dialog bodies and nested
   dialog footers. Keep supported actions scoped to the active confirmation and

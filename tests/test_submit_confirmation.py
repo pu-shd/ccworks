@@ -107,6 +107,7 @@ class TestReportTotalsConfirmation(SubmitTestCase):
     REPORT = "SUBMIT totals confirmation"
 
     def setUp(self):
+        self.REPORT = "SUBMIT totals confirmation " + self._testMethodName
         self.client.create_draft_report(self.REPORT, "submit", "", headless=True)
         self.reconcile_every_row(self.REPORT)
 

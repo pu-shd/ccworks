@@ -6,6 +6,7 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .claude
+**/.ccworks-state
 .env*
 concur_session*.json
 screenshots
