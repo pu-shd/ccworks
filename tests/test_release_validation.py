@@ -1,6 +1,7 @@
 """A passing mock suite cannot substitute for dated, approved live evidence."""
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +10,7 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfoNotFoundError
 
+from ccworks import release_validation
 from ccworks.release_validation import CHECKS, validate_candidate, validate_evidence
 
 
@@ -157,3 +159,83 @@ class TestValidatedCodeIdentity(unittest.TestCase):
         (self.root / "app.py").write_text("VALUE = 3\n")
         with self.assertRaisesRegex(ValueError, "uncommitted"):
             validate_candidate(self.root, self.candidate)
+
+    def test_macos_exception_allows_only_release_tooling_changes(self):
+        exception = self.root / release_validation.MACOS_EXCEPTION
+        exception.write_text("{}\n")
+        self.commit()
+        allowed = release_validation.MACOS_EXCEPTION_FILES
+        validate_candidate(self.root, self.candidate, allowed_changes=allowed)
+        (self.root / "app.py").write_text("VALUE = 2\n")
+        self.commit()
+        with self.assertRaisesRegex(ValueError, "changed after"):
+            validate_candidate(self.root, self.candidate, allowed_changes=allowed)
+
+
+class TestMacOSReleaseException(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / "release").mkdir()
+        self.evidence = passed()
+        self.evidence.update(
+            candidate_commit="476839d83b8389309c27582d1b23fc1ddda4933d",
+            status="pending",
+            approved_for_release=False,
+        )
+        checks = {"session_reuse", "fields_receipts_allocations"}
+        self.evidence["checks"] = {key: key in checks for key in CHECKS}
+        self.artifact = self.root / "ccworks-desktop-0.8.0-arm64.dmg"
+        self.artifact.write_bytes(b"fixture disk image")
+        self.record = {
+            "tag": "v0.8.0",
+            "platform": "macos-arm64",
+            "approved_for_release": True,
+            "candidate_commit": self.evidence["candidate_commit"],
+            "artifact": self.artifact.name,
+            "sha256": hashlib.sha256(self.artifact.read_bytes()).hexdigest(),
+            "untested_checks": sorted(CHECKS - checks),
+        }
+        self.manifest = self.root / "release/macos-v0.8.0-exception.json"
+        self.addCleanup(patch.stopall)
+        patch.object(release_validation, "validate_candidate").start()
+        patch.object(
+            release_validation, "_git", return_value=json.dumps(self.evidence)
+        ).start()
+
+    def verify(self, tag="v0.8.0", artifact=None):
+        self.manifest.write_text(json.dumps(self.record))
+        release_validation.validate_macos_exception(
+            self.root, tag, self.evidence, artifact=artifact
+        )
+
+    def test_exception_approves_only_the_named_mac_artifact(self):
+        self.verify(artifact=self.artifact)
+        with self.assertRaisesRegex(ValueError, "blocked"):
+            validate_evidence(self.evidence, require_live=True)
+        self.artifact.write_bytes(b"replaced disk image")
+        with self.assertRaisesRegex(ValueError, "digest"):
+            self.verify(artifact=self.artifact)
+
+    def test_other_release_tags_and_unauthorized_records_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "tag"):
+            self.verify(tag="v0.8.1")
+        for key, value in (
+            ("platform", "windows-x64"),
+            ("artifact", "unrelated.dmg"),
+            ("candidate_commit", "f" * 40),
+            ("approved_for_release", False),
+            ("untested_checks", []),
+        ):
+            with self.subTest(field=key):
+                before = self.record[key]
+                self.record[key] = value
+                with self.assertRaisesRegex(ValueError, "exception"):
+                    self.verify()
+                self.record[key] = before
+
+    def test_draft_evidence_cannot_change_after_the_test(self):
+        with patch.object(release_validation, "_git", return_value="{}"):
+            with self.assertRaisesRegex(ValueError, "evidence"):
+                self.verify()

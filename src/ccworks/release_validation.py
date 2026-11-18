@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import date, datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -27,6 +28,19 @@ FIELDS = {
     "checks",
 }
 EVIDENCE = "release/live-validation.json"
+MACOS_EXCEPTION = "release/macos-v0.8.0-exception.json"
+MACOS_EXCEPTION_TAG = "v0.8.0"
+MACOS_EXCEPTION_ARTIFACT = "ccworks-desktop-0.8.0-arm64.dmg"
+MACOS_EXCEPTION_CANDIDATE = "476839d83b8389309c27582d1b23fc1ddda4933d"
+MACOS_EXCEPTION_EVIDENCE = "8c212c0e560371b4df77da678b1a6151f2d45c90"
+MACOS_EXCEPTION_FILES = frozenset(
+    {
+        MACOS_EXCEPTION,
+        ".github/workflows/release-validation.yml",
+        "src/ccworks/release_validation.py",
+        "tests/test_release_validation.py",
+    }
+)
 
 
 def validate_evidence(
@@ -110,7 +124,12 @@ def _without_project_version(text: str) -> str:
     return normalized
 
 
-def validate_candidate(root: Path, candidate: str) -> None:
+def validate_candidate(
+    root: Path,
+    candidate: str,
+    *,
+    allowed_changes: frozenset[str] = frozenset({EVIDENCE, "pyproject.toml"}),
+) -> None:
     """Only the evidence and a version-only packaging change may follow the test."""
     try:
         subprocess.run(
@@ -119,7 +138,7 @@ def validate_candidate(root: Path, candidate: str) -> None:
             capture_output=True,
         )
         changed = set(_git(root, "diff", "--name-only", candidate, "HEAD").splitlines())
-        if changed - {EVIDENCE, "pyproject.toml"}:
+        if changed - allowed_changes:
             raise ValueError("Release blocked: code changed after live validation")
         if "pyproject.toml" in changed:
             before = _git(root, "show", candidate + ":pyproject.toml")
@@ -139,17 +158,86 @@ def validate_candidate(root: Path, candidate: str) -> None:
         ) from error
 
 
+def validate_macos_exception(
+    root: Path, tag: str | None, evidence: Any, *, artifact: Path | None = None
+) -> None:
+    """Verify the owner's one-time authorization against the frozen draft test."""
+    if tag != MACOS_EXCEPTION_TAG:
+        raise ValueError(
+            "The Apple Silicon release exception is restricted to tag v0.8.0"
+        )
+    validate_evidence(evidence, require_live=False)
+    if (
+        evidence["candidate_commit"] != MACOS_EXCEPTION_CANDIDATE
+        or evidence["status"] != "pending"
+        or evidence["approved_for_release"]
+        or not evidence["validated_at"]
+        or {name for name, passed in evidence["checks"].items() if passed}
+        != {"session_reuse", "fields_receipts_allocations"}
+    ):
+        raise ValueError(
+            "The Apple Silicon release exception requires the recorded draft evidence"
+        )
+    try:
+        frozen = json.loads(
+            _git(root, "show", f"{MACOS_EXCEPTION_EVIDENCE}:{EVIDENCE}")
+        )
+    except subprocess.CalledProcessError as error:
+        raise ValueError("The recorded draft evidence cannot be verified") from error
+    if evidence != frozen:
+        raise ValueError("The recorded draft evidence changed")
+    record = json.loads((root / MACOS_EXCEPTION).read_text())
+    digest = record.get("sha256") if isinstance(record, dict) else None
+    expected = {
+        "tag": tag,
+        "platform": "macos-arm64",
+        "approved_for_release": True,
+        "candidate_commit": MACOS_EXCEPTION_CANDIDATE,
+        "artifact": MACOS_EXCEPTION_ARTIFACT,
+        "sha256": digest,
+        "untested_checks": sorted(
+            name for name, passed in evidence["checks"].items() if not passed
+        ),
+    }
+    if (
+        record != expected
+        or record["approved_for_release"] is not True
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+    ):
+        raise ValueError("The Apple Silicon release exception record is invalid")
+    validate_candidate(
+        root, MACOS_EXCEPTION_EVIDENCE, allowed_changes=MACOS_EXCEPTION_FILES
+    )
+    if artifact is not None:
+        if artifact.name != MACOS_EXCEPTION_ARTIFACT or artifact.is_symlink():
+            raise ValueError(
+                "The artifact is outside the Apple Silicon release exception"
+            )
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
+            raise ValueError("The Apple Silicon release artifact digest differs")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-live", action="store_true")
+    parser.add_argument("--allow-macos-v080-exception", action="store_true")
+    parser.add_argument("--artifact", type=Path)
     parser.add_argument("--tag")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[2]
     try:
+        if args.allow_macos_v080_exception and not args.require_live:
+            raise ValueError("The release exception requires --require-live")
+        if args.artifact and not args.allow_macos_v080_exception:
+            raise ValueError("--artifact requires the Apple Silicon release exception")
         data = json.loads((root / EVIDENCE).read_text())
-        validate_evidence(data, require_live=args.require_live)
-        if args.require_live:
-            validate_candidate(root, data["candidate_commit"])
+        if args.allow_macos_v080_exception:
+            validate_macos_exception(root, args.tag, data, artifact=args.artifact)
+        else:
+            validate_evidence(data, require_live=args.require_live)
+            if args.require_live:
+                validate_candidate(root, data["candidate_commit"])
         if args.tag:
             version = re.search(
                 r'^version = "([^"]+)"$', (root / "pyproject.toml").read_text(), re.M
@@ -165,6 +253,9 @@ def main(argv=None):
         )
         print("FAIL: " + message)
         return 1
+    if args.allow_macos_v080_exception:
+        print("PASS: owner-approved Apple Silicon v0.8.0 release exception verified")
+        return 0
     print(
         "PASS: live validation and release approval verified"
         if args.require_live

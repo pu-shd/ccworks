@@ -25,4 +25,9 @@ jobs:
           set -euo pipefail
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements-dev.lock
-          .venv/bin/python -m ccworks.release_validation --require-live --tag "$RELEASE_TAG"
+          flags=(--require-live --tag "$RELEASE_TAG")
+          if [[ "$RELEASE_TAG" == v0.8.0 && -f release/macos-v0.8.0-exception.json ]]; then
+            .venv/bin/python -m unittest -v tests.test_release_validation
+            flags+=(--allow-macos-v080-exception)
+          fi
+          .venv/bin/python -m ccworks.release_validation "${flags[@]}"

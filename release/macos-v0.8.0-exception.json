@@ -1,0 +1,14 @@
+{
+  "tag": "v0.8.0",
+  "platform": "macos-arm64",
+  "approved_for_release": true,
+  "candidate_commit": "476839d83b8389309c27582d1b23fc1ddda4933d",
+  "artifact": "ccworks-desktop-0.8.0-arm64.dmg",
+  "sha256": "a164480cb2fef78b46ca4792c14f51cf97821fa7584b96841669eb5c0c5dd0fb",
+  "untested_checks": [
+    "independent_submitted_status",
+    "redacted_events",
+    "rerun_without_duplicates",
+    "three_stage_submission"
+  ]
+}
