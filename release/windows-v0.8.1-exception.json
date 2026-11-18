@@ -1,0 +1,21 @@
+{
+  "tag": "v0.8.1",
+  "platform": "windows-x64",
+  "approved_for_release": true,
+  "candidate_commit": "476839d83b8389309c27582d1b23fc1ddda4933d",
+  "artifact": "ccworks-desktop-0.8.1-windows-x64.exe",
+  "sha256": "5f5263655f7b8400606c31c2b454f03b4ba40f91c350a7c3e61bf855041740c8",
+  "windows_installer_checks": [
+    "authenticode_signatures_and_timestamps",
+    "chrome_and_setup_window",
+    "invalid_update_signature_rejected",
+    "per_user_install_reinstall_uninstall",
+    "signed_update_preserves_state"
+  ],
+  "untested_checks": [
+    "independent_submitted_status",
+    "redacted_events",
+    "rerun_without_duplicates",
+    "three_stage_submission"
+  ]
+}
