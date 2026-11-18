@@ -71,7 +71,18 @@ try {
     }
     New-Item -ItemType Directory -Path $statePath -Force | Out-Null
     Set-Content -Path $session -Value '{"fixture":"not a real session"}'
+    $staleMetadata = Join-Path $installPath '_internal\ccworks-0.0.0.dist-info'
+    New-Item -ItemType Directory -Path $staleMetadata | Out-Null
+    Set-Content -LiteralPath (Join-Path $staleMetadata 'METADATA') -Value @(
+        'Metadata-Version: 2.1', 'Name: ccworks', 'Version: 0.0.0'
+    )
     Run-Installer $installer $quiet
+    if (Test-Path -LiteralPath $staleMetadata) {
+        throw 'Reinstall left older ccworks version metadata behind.'
+    }
+    if ((& $helper --version).Trim() -ne "ccworks $version" -or $LASTEXITCODE -ne 0) {
+        throw 'Reinstall did not resolve the installed release version.'
+    }
     if ((Get-Content -Raw $session).Trim() -ne '{"fixture":"not a real session"}') {
         throw 'Reinstall changed the saved session.'
     }

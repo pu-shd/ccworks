@@ -46,6 +46,8 @@ WINDOWS_EXCEPTION_FILES = frozenset(
     {
         WINDOWS_EXCEPTION,
         "pyproject.toml",
+        "desktop/ccworks.iss",
+        "desktop/test-windows-installer.ps1",
         ".github/workflows/release-validation.yml",
         "src/ccworks/release_validation.py",
         "tests/test_release_validation.py",

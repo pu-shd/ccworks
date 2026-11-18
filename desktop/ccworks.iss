@@ -36,6 +36,38 @@ Source: "..\dist\ccworks-desktop\*"; DestDir: "{app}"; Flags: recursesubdirs cre
 Name: "{userprograms}\ccworks Desktop"; Filename: "{app}\ccworks-desktop.exe"
 
 [Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  MetadataRoot, InstalledMetadata: String;
+  Entry: TFindRec;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  MetadataRoot := ExpandConstant('{app}\_internal\');
+  InstalledMetadata := 'ccworks-{#AppVersion}.dist-info';
+  if not DirExists(MetadataRoot + InstalledMetadata) then
+    RaiseException('The installed ccworks version metadata is missing.');
+
+  if FindFirst(MetadataRoot + 'ccworks-*.dist-info', Entry) then
+  begin
+    try
+      repeat
+        if ((Entry.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+           (CompareText(Entry.Name, InstalledMetadata) <> 0) then
+        begin
+          if (Entry.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+            RaiseException('An older ccworks metadata directory is a link.');
+          if not DelTree(MetadataRoot + Entry.Name, True, True, True) then
+            RaiseException('Could not remove older ccworks version metadata.');
+        end;
+      until not FindNext(Entry);
+    finally
+      FindClose(Entry);
+    end;
+  end;
+end;
+
 function PurgeRequested(): Boolean;
 var
   Index: Integer;
