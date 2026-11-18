@@ -31,6 +31,7 @@ $installer = (Resolve-Path "dist\ccworks-desktop-$version-windows-x64.exe").Path
 $uninstaller = Join-Path $installPath 'unins000.exe'
 $helper = Join-Path $installPath 'ccworks.exe'
 $session = Join-Path $statePath 'concur_session.json'
+$staleMetadata = Join-Path $installPath '_internal\ccworks-0.0.0.dist-info'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'ccworks Desktop.lnk'
 $quiet = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
 
@@ -71,7 +72,6 @@ try {
     }
     New-Item -ItemType Directory -Path $statePath -Force | Out-Null
     Set-Content -Path $session -Value '{"fixture":"not a real session"}'
-    $staleMetadata = Join-Path $installPath '_internal\ccworks-0.0.0.dist-info'
     New-Item -ItemType Directory -Path $staleMetadata | Out-Null
     Set-Content -LiteralPath (Join-Path $staleMetadata 'METADATA') -Value @(
         'Metadata-Version: 2.1', 'Name: ccworks', 'Version: 0.0.0'
@@ -92,6 +92,9 @@ try {
     }
     Write-Output 'PASS: per-user install, reinstall, and uninstall with cleanup.'
 } finally {
+    if (Test-Path -LiteralPath $staleMetadata) {
+        Remove-Item -LiteralPath $staleMetadata -Recurse -Force
+    }
     if (Test-Path $uninstaller) {
         Run-Installer $uninstaller ($quiet + @('/PURGECCWORKSDATA'))
     }
