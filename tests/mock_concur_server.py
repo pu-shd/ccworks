@@ -595,13 +595,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 ['allocations-addBtn', 'sal-btn-buttonbar-add'],
                 ['allocations-removeBtn', 'sal-btn-buttonbar-remove'],
                 ['allocation-modal-save', 'sal-btn-allocation-modal-save'],
-                ['Ct-add-btn', 'At-add-btn'],
             ]) {
                 const button = document.querySelector(`[data-nuiexp="${legacy}"], [data-nuiexp="${current}"]`);
                 if (button) button.setAttribute('data-nuiexp', sal ? current : legacy);
             }
+            const form = document.getElementById('add-allocation-form');
+            const useItControls = sal && report.mock_options.it_allocation_controls;
+            form.querySelector('button[onclick="saveAddAllocation()"]').setAttribute(
+                'data-nuiexp', useItControls ? 'It-add-btn' : (sal ? 'At-add-btn' : 'Ct-add-btn'));
+            form.querySelector('button[data-nuiexp$="-cancel-btn"]').setAttribute(
+                'data-nuiexp', useItControls ? 'It-cancel-btn' : 'At-cancel-btn');
             toggleRowMenu(idx);
-            document.getElementById('add-allocation-form').style.display = 'none';
+            form.style.display = 'none';
             document.getElementById('allocations-modal').style.display = 'block';
             renderAllocationsList();
         }

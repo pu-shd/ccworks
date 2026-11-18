@@ -11,9 +11,10 @@ RUN python -m virtualenv --no-download "$VIRTUAL_ENV"
 
 # Install the ccworks package (and its declared dependencies) editable so
 # the source tree in /app is directly runnable as a module.
-COPY pyproject.toml README.md LICENSE.md requirements.lock requirements-dev.lock ./
+COPY pyproject.toml README.md LICENSE.md requirements.lock requirements-dev.lock requirements-desktop.lock ./
 COPY src/ ./src/
 COPY tests/ ./tests/
+COPY desktop/ ./desktop/
 COPY .github/workflows/ci.yml ./.github/workflows/ci.yml
 COPY release/ ./release/
 COPY plugins/ ./plugins/

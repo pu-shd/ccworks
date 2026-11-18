@@ -17,6 +17,7 @@ import queue
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,6 +25,8 @@ from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from ccworks import __version__
+from ccworks.browser_launch import BrowserUnavailable
+from ccworks.session_state import save_state_atomically
 
 
 class SafariLoginError(RuntimeError):
@@ -213,7 +216,7 @@ class MCPClient:
                     process.wait(timeout=1)
             # A descendant can keep stdout open after the driver exits. Kill
             # only this owned process group, never Safari or unrelated drivers.
-            if os.name == "posix":
+            if sys.platform != "win32":
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -227,30 +230,6 @@ class MCPClient:
 
     def __exit__(self, *args):
         self.close()
-
-
-def save_state_atomically(path: Path, state: dict[str, Any]) -> None:
-    """Replace a session only after the caller has validated it."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    candidate = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix=".session-",
-            suffix=".json",
-            dir=path.parent,
-            delete=False,
-        ) as stream:
-            candidate = Path(stream.name)
-            os.chmod(candidate, 0o600)
-            json.dump(state, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(candidate, path)
-    finally:
-        if candidate is not None:
-            candidate.unlink(missing_ok=True)
 
 
 def _trusted_host(base_url: str, hostname: str | None) -> bool:
@@ -443,8 +422,6 @@ class LoginCancelled(RuntimeError):
 
 
 def wait_for_login() -> None:
-    import sys
-
     sys.stderr.write(
         "\nComplete Concur sign-in and MFA in Safari. Once the expense dashboard "
         "is visible, return here and press ENTER (Ctrl-C cancels): "
@@ -460,8 +437,6 @@ def capture_safari_state(base_url: str) -> dict[str, Any]:
     Safari advertises its tool schemas at runtime. Only recognized arguments
     are supplied. Unknown required arguments trigger the Chromium fallback.
     """
-    import sys
-
     if sys.platform != "darwin":
         raise SafariLoginError("Safari MCP authentication requires macOS and Safari 27")
     with MCPClient(["/usr/bin/safaridriver", "--mcp"]) as mcp, ExitStack() as cleanup:
@@ -673,14 +648,13 @@ def run_login(
     *,
     client_factory: Any = None,
     safari_capture: Any = None,
+    confirm: Any = None,
 ) -> dict[str, Any]:
     """Capture privately, prove headless reuse, then atomically promote.
 
     Both capture backends use the same transaction. No candidate failure or
     cancellation changes the canonical state. Runtime clients still use Chromium.
     """
-    import sys
-
     if browser not in ("chromium", "safari", "auto"):
         raise ValueError("Login browser must be chromium, safari, or auto")
     if browser in ("safari", "auto"):
@@ -692,7 +666,13 @@ def run_login(
     if client_factory is None:
         from ccworks.browser_client import ConcurBrowserClient
 
-        client_factory = ConcurBrowserClient
+        def client_factory(**kwargs):
+            return ConcurBrowserClient(
+                **kwargs,
+                browser_launch=client.browser_launch,
+                desktop=client.desktop,
+            )
+
     capture = safari_capture or capture_safari_state
     destination = Path(client.session_file)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -702,9 +682,12 @@ def run_login(
     for backend in backends:
         stage = "Safari session export" if backend == "safari" else "Chromium login"
         try:
-            with tempfile.TemporaryDirectory(
-                prefix=".login-", dir=destination.parent
-            ) as directory:
+            with (
+                client._session_lock(),
+                tempfile.TemporaryDirectory(
+                    prefix=".login-", dir=destination.parent
+                ) as directory,
+            ):
                 candidate_path = Path(directory) / "state.json"
                 staged = client_factory(
                     session_file=str(candidate_path), base_url=client.base_url
@@ -714,7 +697,10 @@ def run_login(
                     _require_auth_state(state, client.base_url)
                     save_state_atomically(candidate_path, state)
                 else:
-                    staged.run_headed_login()
+                    if confirm is None:
+                        staged.run_headed_login()
+                    else:
+                        staged.run_headed_login(confirm=confirm)
                 stage = "candidate validation"
                 state = json.loads(candidate_path.read_text(encoding="utf-8"))
                 _require_auth_state(state, client.base_url)
@@ -733,18 +719,21 @@ def run_login(
                 state = json.loads(candidate_path.read_text(encoding="utf-8"))
                 _require_auth_state(state, client.base_url)
                 stage = "saved session promotion"
-                with client._session_lock():
-                    save_state_atomically(destination, state)
+                save_state_atomically(destination, state)
             return {
                 "login_browser": backend,
-                "verification_browser": "chromium",
+                "verification_browser": (
+                    staged.browser_launch.kind
+                    if getattr(staged, "desktop", False) is True
+                    else "chromium"
+                ),
                 "fallback_used": backend == "chromium" and browser != "chromium",
             }
         except (EOFError, LoginCancelled):
             raise LoginCancelled(
                 "Login cancelled; the saved session was preserved"
             ) from None
-        except (KeyboardInterrupt, SystemExit):
+        except (KeyboardInterrupt, SystemExit, BrowserUnavailable, TimeoutError):
             raise
         except Exception as error:
             # Only known messages and capability names may cross the CLI

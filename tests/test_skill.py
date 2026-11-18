@@ -30,7 +30,13 @@ class TestCCWorksSkill(unittest.TestCase):
         manifest = json.loads((PLUGIN / "plugin.json").read_text())
         self.assertEqual(entry["name"], manifest["name"])
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+(?:-[\w.]+)?$")
-        self.assertEqual({"$schema", "name", "version", "description"}, set(manifest))
+        self.assertEqual(
+            {"$schema", "name", "version", "description", "extensions"}, set(manifest)
+        )
+        self.assertEqual(
+            {"com.openai": {"requires_local_executor": True}}, manifest["extensions"]
+        )
+        self.assertIn("Windows or macOS", manifest["description"])
 
     def test_discovery_and_ui_metadata_are_valid(self):
         text = (SKILL / "SKILL.md").read_text()

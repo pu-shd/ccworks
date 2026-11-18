@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "eligible_from": "2026-12-01",
+  "eligible_from": "2026-11-18",
   "status": "pending",
-  "candidate_commit": null,
-  "validated_at": null,
+  "candidate_commit": "476839d83b8389309c27582d1b23fc1ddda4933d",
+  "validated_at": "2026-11-18T14:32:32-05:00",
   "approved_for_release": false,
   "checks": {
-    "session_reuse": false,
-    "fields_receipts_allocations": false,
+    "session_reuse": true,
+    "fields_receipts_allocations": true,
     "rerun_without_duplicates": false,
     "three_stage_submission": false,
     "independent_submitted_status": false,

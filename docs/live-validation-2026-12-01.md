@@ -1,14 +1,17 @@
 # Development candidate and live release gate
 
-The next report is expected on **December 1, 2026**. Keep the candidate on
-`dev/reliability` until that report has been reconciled and submitted successfully
-with the development client, its saved state independently verified, and the
-owner has approved a release. CI success alone is not production validation.
+The owner moved live validation eligibility to **November 18, 2026**. Use an
+actual unsubmitted Concur report designated by the owner. Reconcile and submit
+that report with the development client, independently verify the saved state,
+and record the owner's release approval. CI success alone does not satisfy the
+live test.
 
-The installed Homebrew release and `main` remain at 0.7.1 during development.
-Do not create a new version tag, publish a release, merge this candidate to
-`main`, or update the Homebrew formula before the gate passes. Do not create a
-fabricated production report or modify the already submitted November report.
+Development changes can merge to `main` after CI. Follow this gate before
+creating a release tag, publishing a release, or updating the Homebrew formula.
+The owner approved one-time exceptions for the Apple Silicon v0.8.0 and Windows
+x64 v0.8.1 installers. Each approval is recorded under its release tag.
+Use the full live gate for future releases. Use the report designated by the
+owner and leave already submitted reports alone.
 
 ## Scope and evidence
 
@@ -45,10 +48,10 @@ focused commits, and live acceptance criteria:
   including a process watchdog for unresponsive renderer calls.
 
 Do not describe those remaining changes as implemented or live validated. Freeze
-the complete intended candidate before the December test; changes to code,
+the complete intended candidate before the live test; changes to code,
 dependency pins, or runtime configuration afterward require revalidation.
 
-## Before December 1
+## Before live validation
 
 1. Commit each focused change to the development branch. Reproduce bugs in tests
    before fixing them. Use synthetic reports and mock browser fixtures only.
@@ -60,12 +63,11 @@ dependency pins, or runtime configuration afterward require revalidation.
 4. Use the existing pinned dependencies. No tag or Homebrew release is needed
    to test a development checkout.
 
-## December 1 live validation
+## Live validation
 
 This is a supervised test with the real report and the owner's actual receipt,
 allocation, and justification instructions. It is not a scheduled unattended
-submission. The November submission approval does not authorize December's
-report submission.
+submission. Approval for a previous report does not authorize submitting the designated report.
 
 1. Use the development checkout's own `.venv`; keep the installed Homebrew
    command available as a fallback. Install the locked dependencies into that

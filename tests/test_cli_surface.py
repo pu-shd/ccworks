@@ -14,18 +14,33 @@ import subprocess
 import sys
 import unittest
 from argparse import Namespace
+from unittest.mock import patch
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ccworks.cli import (  # noqa: E402
     LEGACY_COMMANDS,
+    Spinner,
     _legacy_command,
     build_parser,
     split_incomplete_expenses,
 )
 
 CLI_SOURCE = (REPO_ROOT / "src" / "ccworks" / "cli.py").read_text()
+
+
+class TestSpinner(unittest.TestCase):
+    def test_progress_is_silent_for_redirected_and_desktop_commands(self):
+        for interactive, frozen in ((False, False), (True, True)):
+            with (
+                self.subTest(interactive=interactive, frozen=frozen),
+                patch.object(sys.stderr, "isatty", return_value=interactive),
+                patch.object(sys, "frozen", frozen, create=True),
+                patch("ccworks.cli.threading.Thread") as thread,
+                Spinner("Example confidential report title"),
+            ):
+                thread.assert_not_called()
 
 # Subcommands whose token depends on a flag, and the flags that switch them.
 FLAG_DEPENDENT = {
