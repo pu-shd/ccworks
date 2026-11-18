@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import date, datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -27,6 +28,29 @@ FIELDS = {
     "checks",
 }
 EVIDENCE = "release/live-validation.json"
+WINDOWS_EXCEPTION = "release/windows-v0.8.1-exception.json"
+WINDOWS_EXCEPTION_TAG = "v0.8.1"
+WINDOWS_EXCEPTION_ARTIFACT = "ccworks-desktop-0.8.1-windows-x64.exe"
+WINDOWS_EXCEPTION_CANDIDATE = "476839d83b8389309c27582d1b23fc1ddda4933d"
+WINDOWS_EXCEPTION_EVIDENCE = "8c212c0e560371b4df77da678b1a6151f2d45c90"
+WINDOWS_INSTALLER_CHECKS = frozenset(
+    {
+        "authenticode_signatures_and_timestamps",
+        "chrome_and_setup_window",
+        "invalid_update_signature_rejected",
+        "per_user_install_reinstall_uninstall",
+        "signed_update_preserves_state",
+    }
+)
+WINDOWS_EXCEPTION_FILES = frozenset(
+    {
+        WINDOWS_EXCEPTION,
+        "pyproject.toml",
+        ".github/workflows/release-validation.yml",
+        "src/ccworks/release_validation.py",
+        "tests/test_release_validation.py",
+    }
+)
 
 
 def validate_evidence(
@@ -110,7 +134,12 @@ def _without_project_version(text: str) -> str:
     return normalized
 
 
-def validate_candidate(root: Path, candidate: str) -> None:
+def validate_candidate(
+    root: Path,
+    candidate: str,
+    *,
+    allowed_changes: frozenset[str] = frozenset({EVIDENCE, "pyproject.toml"}),
+) -> None:
     """Only the evidence and a version-only packaging change may follow the test."""
     try:
         subprocess.run(
@@ -119,7 +148,7 @@ def validate_candidate(root: Path, candidate: str) -> None:
             capture_output=True,
         )
         changed = set(_git(root, "diff", "--name-only", candidate, "HEAD").splitlines())
-        if changed - {EVIDENCE, "pyproject.toml"}:
+        if changed - allowed_changes:
             raise ValueError("Release blocked: code changed after live validation")
         if "pyproject.toml" in changed:
             before = _git(root, "show", candidate + ":pyproject.toml")
@@ -139,17 +168,87 @@ def validate_candidate(root: Path, candidate: str) -> None:
         ) from error
 
 
+def validate_windows_exception(
+    root: Path, tag: str | None, evidence: Any, *, artifact: Path | None = None
+) -> None:
+    """Verify the owner's one-time authorization against the frozen draft test."""
+    if tag != WINDOWS_EXCEPTION_TAG:
+        raise ValueError(
+            "The Windows x64 release exception is restricted to tag v0.8.1"
+        )
+    validate_evidence(evidence, require_live=False)
+    if (
+        evidence["candidate_commit"] != WINDOWS_EXCEPTION_CANDIDATE
+        or evidence["status"] != "pending"
+        or evidence["approved_for_release"]
+        or not evidence["validated_at"]
+        or {name for name, passed in evidence["checks"].items() if passed}
+        != {"session_reuse", "fields_receipts_allocations"}
+    ):
+        raise ValueError(
+            "The Windows x64 release exception requires the recorded draft evidence"
+        )
+    try:
+        frozen = json.loads(
+            _git(root, "show", f"{WINDOWS_EXCEPTION_EVIDENCE}:{EVIDENCE}")
+        )
+    except subprocess.CalledProcessError as error:
+        raise ValueError("The recorded draft evidence cannot be verified") from error
+    if evidence != frozen:
+        raise ValueError("The recorded draft evidence changed")
+    record = json.loads((root / WINDOWS_EXCEPTION).read_text())
+    digest = record.get("sha256") if isinstance(record, dict) else None
+    expected = {
+        "tag": tag,
+        "platform": "windows-x64",
+        "approved_for_release": True,
+        "candidate_commit": WINDOWS_EXCEPTION_CANDIDATE,
+        "artifact": WINDOWS_EXCEPTION_ARTIFACT,
+        "sha256": digest,
+        "windows_installer_checks": sorted(WINDOWS_INSTALLER_CHECKS),
+        "untested_checks": sorted(
+            name for name, passed in evidence["checks"].items() if not passed
+        ),
+    }
+    if (
+        record != expected
+        or record["approved_for_release"] is not True
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+    ):
+        raise ValueError("The Windows x64 release exception record is invalid")
+    validate_candidate(
+        root, WINDOWS_EXCEPTION_EVIDENCE, allowed_changes=WINDOWS_EXCEPTION_FILES
+    )
+    if artifact is not None:
+        if artifact.name != WINDOWS_EXCEPTION_ARTIFACT or artifact.is_symlink():
+            raise ValueError(
+                "The artifact is outside the Windows x64 release exception"
+            )
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
+            raise ValueError("The Windows x64 release artifact digest differs")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-live", action="store_true")
+    parser.add_argument("--allow-windows-v081-exception", action="store_true")
+    parser.add_argument("--artifact", type=Path)
     parser.add_argument("--tag")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[2]
     try:
+        if args.allow_windows_v081_exception and not args.require_live:
+            raise ValueError("The release exception requires --require-live")
+        if args.artifact and not args.allow_windows_v081_exception:
+            raise ValueError("--artifact requires the Windows x64 release exception")
         data = json.loads((root / EVIDENCE).read_text())
-        validate_evidence(data, require_live=args.require_live)
-        if args.require_live:
-            validate_candidate(root, data["candidate_commit"])
+        if args.allow_windows_v081_exception:
+            validate_windows_exception(root, args.tag, data, artifact=args.artifact)
+        else:
+            validate_evidence(data, require_live=args.require_live)
+            if args.require_live:
+                validate_candidate(root, data["candidate_commit"])
         if args.tag:
             version = re.search(
                 r'^version = "([^"]+)"$', (root / "pyproject.toml").read_text(), re.M
@@ -165,6 +264,9 @@ def main(argv=None):
         )
         print("FAIL: " + message)
         return 1
+    if args.allow_windows_v081_exception:
+        print("PASS: owner-approved Windows x64 v0.8.1 release exception verified")
+        return 0
     print(
         "PASS: live validation and release approval verified"
         if args.require_live
