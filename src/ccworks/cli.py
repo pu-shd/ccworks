@@ -69,6 +69,8 @@ class Spinner:
         sys.stderr.flush()
 
     def __enter__(self):
+        if not sys.stderr.isatty() or getattr(sys, "frozen", False):
+            return self
         self.running = True
         self.thread = threading.Thread(target=self.spin)
         self.thread.start()
