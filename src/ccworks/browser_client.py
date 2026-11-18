@@ -1,17 +1,20 @@
 import sys
 import os
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import time
 from datetime import datetime
 import logging
-import contextlib
 import re
-from typing import Any, Dict, List, Optional, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
 
 from ccworks import paths
 from ccworks.browser_bootstrap import ensure_chromium
+from ccworks.browser_launch import BrowserLaunch, driver_temp_environment
+from ccworks.session_state import save_state_atomically, session_lock
 from ccworks.operation_events import RedactedBrowserDiagnostics
 
 # Configure logging
@@ -20,9 +23,44 @@ logger = logging.getLogger("ConcurBrowserClient")
 logger.addFilter(RedactedBrowserDiagnostics())
 
 
+SIGN_IN_MESSAGE = (
+    "Open ccworks Desktop, choose Sign in to Concur, and complete sign-in in the browser. "
+    "Then return to this chat."
+)
+
+
 class ConcurSessionExpiredError(RuntimeError):
     """Exception raised when the Concur session has expired and requires re-login."""
     pass
+
+
+def verify_dashboard_session(page: Any, base_url: str) -> None:
+    """Confirm both a reachable dashboard and a usable first-party JWT."""
+    from ccworks.safari_login import SafariLoginError, _require_auth_state, _trusted_host
+
+    response = page.goto(f"{base_url}/nui/expense", timeout=15000)
+
+    def require_authenticated_page() -> None:
+        final = urlsplit(page.url)
+        if (
+            final.scheme != urlsplit(base_url).scheme
+            or not _trusted_host(base_url, final.hostname)
+            or re.search(r"(?:login|sign.?in)", final.path, re.IGNORECASE)
+            or (response is not None and response.status in (401, 403))
+        ):
+            raise ConcurSessionExpiredError(SIGN_IN_MESSAGE)
+        try:
+            _require_auth_state({"cookies": page.context.cookies()}, base_url)
+        except SafariLoginError:
+            raise ConcurSessionExpiredError(SIGN_IN_MESSAGE) from None
+
+    require_authenticated_page()
+    try:
+        page.locator(
+            ".no-reports, .report-card, .report-tile, .cnqr-report-card, .sapMCard"
+        ).filter(visible=True).first.wait_for(state="visible", timeout=15000)
+    finally:
+        require_authenticated_page()
 
 
 class ConcurBrowserClient:
@@ -31,14 +69,22 @@ class ConcurBrowserClient:
     def __init__(
         self,
         session_file: Optional[str] = None,
-        base_url: str = "https://www.concursolutions.com"
+        base_url: str = "https://www.concursolutions.com",
+        *,
+        browser_launch: Optional[BrowserLaunch] = None,
+        desktop: Optional[bool] = None,
     ):
-        self.session_file = session_file if session_file else str(paths.session_file())
+        self.desktop = bool(getattr(sys, "frozen", False)) if desktop is None else desktop
+        self.browser_launch = browser_launch or BrowserLaunch.from_environment(desktop=self.desktop)
+        self.session_file = session_file or str(paths.session_file(desktop=self.desktop))
         self.base_url = base_url.rstrip("/")
-        self.screenshot_dir = str(paths.screenshot_dir())
-        ensure_chromium()
+        self.screenshot_dir = "" if self.desktop else str(paths.screenshot_dir())
+        if self.browser_launch.kind == "playwright":
+            ensure_chromium()
 
     def _take_screenshot(self, page: Any, label: str) -> None:
+        if self.desktop:
+            return
         # Include PID to prevent interference between concurrent runs
         pid = os.getpid()
         path = os.path.join(self.screenshot_dir, f"{label}_{pid}.png")
@@ -1038,22 +1084,8 @@ class ConcurBrowserClient:
                 )
         self._close_cookie_banner(page)
 
-    @contextlib.contextmanager
     def _session_lock(self):
-        """Simple file-based lock for concurrency safety."""
-        lock_file = f"{self.session_file}.lock"
-        with open(lock_file, "w") as f:
-            try:
-                # Exclusive lock, non-blocking if possible (but we'll wait)
-                import fcntl
-                fcntl.flock(f, fcntl.LOCK_EX)
-                yield
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-                try:
-                    os.remove(lock_file)
-                except Exception:
-                    pass
+        return session_lock(Path(self.session_file))
 
     def _check_session(self, page: Any) -> None:
         """Checks if the current page is a login/signin page, indicating an expired session."""
@@ -1062,56 +1094,62 @@ class ConcurBrowserClient:
             title = page.title().lower()
             if "sign in" in title or "login" in title:
                 logger.error("Session expired detected via URL/Title redirection.")
+                if self.desktop:
+                    raise ConcurSessionExpiredError(SIGN_IN_MESSAGE)
                 raise ConcurSessionExpiredError(
                     "Your SAP Concur session has expired. Please re-run the login command:\n"
                     "  ccworks session login"
                 )
 
     @contextmanager
-    def _browser_page(self, headless: bool = True, viewport_height: int = 800):
-        """Chromium with the saved session, yielding a page and closing after.
-
-        Twenty-one call sites repeated this launch/new_context/new_page preamble
-        and its `finally: browser.close()`. One definition means session handling
-        (and anything that has to change about it) lives in one place.
-
-        Deliberately not used by run_headed_login, which must start with no
-        stored state and writes the session file itself.
-        """
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(
-                storage_state=self.session_file,
-                viewport={"width": 1280, "height": viewport_height},
-            )
-            page = context.new_page()
-            page.add_locator_handler(
-                page.locator("#trustarc-banner-overlay"),
-                lambda: self._close_cookie_banner(page),
-            )
-            try:
-                yield page
-            except ConcurSessionExpiredError:
-                # Do not persist here: the context now holds a redirect-to-login
-                # state, and saving it would clobber a session that may still be
-                # good for other work.
-                raise
+    def _driver(self):
+        with ExitStack() as stack:
+            if self.desktop:
+                # The driver and Chrome inherit a private location for profiles
+                # and download staging. Keep it available until they exit.
+                env = stack.enter_context(driver_temp_environment(Path(self.session_file).parent))
             else:
-                # Concur's JWT carries roughly a 60-minute TTL and is refreshed
-                # in-browser during use. Every run used to load the session file
-                # and never write it back, so the refreshed cookie was discarded
-                # at close and the next invocation re-presented the original --
-                # which expires 60 minutes after login regardless of how much
-                # activity happened in between. Persisting the state means each
-                # run inherits the freshest cookies.
-                try:
-                    with self._session_lock():
-                        context.storage_state(path=self.session_file)
-                    logger.debug("Refreshed session state written back.")
-                except Exception as exc:
-                    logger.debug(f"_browser_page: could not persist session state: {exc!r}")
+                env = None
+            try:
+                playwright = stack.enter_context(sync_playwright())
             finally:
-                browser.close()
+                if env is not None:
+                    env()
+            yield playwright
+
+    @contextmanager
+    def _browser_page(self, headless: bool = True, viewport_height: int = 800):
+        """Use and refresh the session under one lock for the whole operation."""
+        path = Path(self.session_file)
+        with self._session_lock():
+            if self.desktop and (path.is_symlink() or not path.is_file()):
+                raise ConcurSessionExpiredError(SIGN_IN_MESSAGE)
+            with self._driver() as p:
+                browser = self.browser_launch.launch(p.chromium, headless=headless)
+                try:
+                    context = browser.new_context(
+                        storage_state=self.session_file,
+                        viewport={"width": 1280, "height": viewport_height},
+                    )
+                    page = context.new_page()
+                    page.add_locator_handler(
+                        page.locator("#trustarc-banner-overlay"),
+                        lambda: self._close_cookie_banner(page),
+                    )
+                    yield page
+                    # Keep only usable refreshed state. A caller may have caught
+                    # a login redirect and returned an error result.
+                    from ccworks.safari_login import _require_auth_state
+
+                    try:
+                        refreshed = context.storage_state()
+                        if self.desktop:
+                            _require_auth_state(refreshed, self.base_url)
+                        save_state_atomically(path, refreshed)
+                    except Exception:
+                        logger.debug("Could not refresh saved session state.")
+                finally:
+                    browser.close()
 
     def _wait_for_dashboard(self, page: Any) -> None:
         """Helper to wait for Concur's dynamic SPA dashboard elements to load."""
@@ -1192,97 +1230,65 @@ class ConcurBrowserClient:
             logger.debug(f"_saved_jwt_expiry: {exc!r}")
         return None
 
-    def run_headed_login(self) -> None:
-        """
-        Launches a headed browser instance to let the user log in manually
-        and handle MFA/2FA or SSO. Once logged in, it saves the session state.
-        """
-        logger.info("Starting headed browser for login...")
-        import sys
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context(viewport={"width": 1280, "height": 800})
-            page = context.new_page()
-
-            logger.info(f"Navigating to login page: {self.base_url}")
-            page.goto(self.base_url)
-
-            # Write all interactive prompts to stderr so they show up even when stdout is redirected
-            sys.stderr.write("\n" + "=" * 80 + "\n")
-            # This command deliberately starts with an empty cookie jar, so the
-            # Concur login screen appears even when the saved session is fine.
-            # Without saying so, that looks like the existing session failing.
-            saved = self._saved_jwt_expiry()
-            if saved:
-                when, mins = saved
-                if mins is None:
-                    sys.stderr.write(f" NOTE: a saved session already exists (expiry {when}).\n")
-                elif mins > 0:
-                    sys.stderr.write(f" NOTE: a saved session already exists and is still "
-                                     f"usable for {mins:.0f} more minute(s) (until {when}).\n")
-                else:
-                    sys.stderr.write(f" NOTE: the saved session expired at {when}.\n")
-                sys.stderr.write(" This command always begins a fresh login with no stored\n")
-                sys.stderr.write(" cookies, so you will see the Concur login screen either way.\n")
-                sys.stderr.write(" Press Ctrl-C now to keep the existing session instead.\n")
-                sys.stderr.write("-" * 80 + "\n")
-            sys.stderr.write(" ACTION REQUIRED:\n")
-            sys.stderr.write(" 1. In the opened browser window, log in to SAP Concur.\n")
-            sys.stderr.write(" 2. Complete any MFA/2FA, Single Sign-On (SSO), or Captchas if prompted.\n")
-            sys.stderr.write(" 3. Once you see the Concur Homepage / Dashboard (fully logged in),\n")
-            sys.stderr.write("    return to this terminal and press ENTER to save your session.\n")
-            sys.stderr.write("=" * 80 + "\n\n")
-            sys.stderr.flush()
-
-            sys.stderr.write("Press ENTER here after you have logged in and see the Concur home page... ")
-            sys.stderr.flush()
-            # Read from stdin
-            if not sys.stdin.readline():
-                browser.close()
-                raise EOFError("Login cancelled; no session was saved")
-
-            # Save authenticated state with lock
-            with self._session_lock():
-                context.storage_state(path=self.session_file)
-            logger.info(f"Session state successfully saved to {self.session_file}")
-            browser.close()
-            logger.info("Browser closed.")
-
-            # Saving state is not the same as capturing a usable session. If the
-            # dashboard had not finished loading when ENTER was pressed, Concur
-            # has not issued its JWT yet and the file is saved without one --
-            # which looked like a successful login, reported "complete", and then
-            # failed on the next command. Say so instead.
-            saved = self._saved_jwt_expiry()
-            if saved is None:
-                raise RuntimeError(
-                    "Login did not capture a Concur session: no JWT cookie was "
-                    "saved. This usually means ENTER was pressed before the Concur "
-                    "dashboard finished loading. Run `ccworks session login` again "
-                    "and wait until the expense dashboard is fully visible before "
-                    "pressing ENTER."
-                )
+    def _confirm_terminal_login(self) -> bool:
+        # Write all interactive prompts to stderr so they show up even when stdout is redirected
+        sys.stderr.write("\n" + "=" * 80 + "\n")
+        # This command deliberately starts with an empty cookie jar, so the
+        # Concur login screen appears even when the saved session is fine.
+        # Without saying so, that looks like the existing session failing.
+        saved = self._saved_jwt_expiry()
+        if saved:
             when, mins = saved
-            if mins is not None and mins <= 0:
-                raise RuntimeError(
-                    f"Login saved an already-expired Concur JWT (expired {when}). "
-                    f"Run `ccworks session login` again."
-                )
-            if mins is not None:
-                logger.info(f"Concur JWT captured; valid for {mins:.0f} more minute(s) "
-                            f"(until {when}).")
+            if mins is None:
+                sys.stderr.write(f" NOTE: a saved session already exists (expiry {when}).\n")
+            elif mins > 0:
+                sys.stderr.write(f" NOTE: a saved session already exists and is still "
+                                 f"usable for {mins:.0f} more minute(s) (until {when}).\n")
+            else:
+                sys.stderr.write(f" NOTE: the saved session expired at {when}.\n")
+            sys.stderr.write(" This command always begins a fresh login with no stored\n")
+            sys.stderr.write(" cookies, so you will see the Concur login screen either way.\n")
+            sys.stderr.write(" Press Ctrl-C now to keep the existing session instead.\n")
+            sys.stderr.write("-" * 80 + "\n")
+        sys.stderr.write(" ACTION REQUIRED:\n")
+        sys.stderr.write(" 1. In the opened browser window, log in to SAP Concur.\n")
+        sys.stderr.write(" 2. Complete any MFA/2FA, Single Sign-On (SSO), or Captchas if prompted.\n")
+        sys.stderr.write(" 3. Once you see the Concur Homepage / Dashboard (fully logged in),\n")
+        sys.stderr.write("    return to this terminal and press ENTER to save your session.\n")
+        sys.stderr.write("=" * 80 + "\n\n")
+        sys.stderr.flush()
+
+        sys.stderr.write("Press ENTER here after you have logged in and see the Concur home page... ")
+        sys.stderr.flush()
+        # Read from stdin
+        if not sys.stdin.readline():
+            return False
+
+        return True
+
+    def run_headed_login(self, confirm: Optional[Callable[[], bool]] = None) -> None:
+        """Capture an isolated candidate session after the user confirms sign-in."""
+        from ccworks.safari_login import LoginCancelled, _require_auth_state
+
+        with self._driver() as p:
+            browser = self.browser_launch.launch(p.chromium, headless=False)
+            try:
+                context = browser.new_context(viewport={"width": 1280, "height": 800})
+                page = context.new_page()
+                page.goto(self.base_url, timeout=30000)
+                if not (confirm or self._confirm_terminal_login)():
+                    raise LoginCancelled("Login cancelled")
+                state = context.storage_state()
+                _require_auth_state(state, self.base_url)
+                with self._session_lock():
+                    save_state_atomically(Path(self.session_file), state)
+            finally:
+                browser.close()
 
     def verify_session_reuse(self, headless: bool = True) -> None:
         """Prove saved-state reuse in a fresh context without capturing report data."""
-        from ccworks.safari_login import _require_auth_state
-
         with self._browser_page(headless=headless) as page:
-            page.goto(f"{self.base_url}/nui/expense", timeout=15000)
-            self._check_session(page)
-            page.locator(
-                ".no-reports, .report-card, .report-tile, .cnqr-report-card, .sapMCard"
-            ).filter(visible=True).first.wait_for(state="visible", timeout=15000)
-            _require_auth_state({"cookies": page.context.cookies()}, self.base_url)
+            verify_dashboard_session(page, self.base_url)
 
     def check_session_validity(self, headless: bool = True) -> Dict[str, Any]:
         """
@@ -3493,27 +3499,19 @@ class ConcurBrowserClient:
                     normalized_name = " ".join(report_name.split()).lower()
                     all_cards_loc = page.locator(", ".join(card_selectors))
                     count = all_cards_loc.count()
-                    print(f"DEBUG: Checking {count} total potential cards for a match...", file=sys.stderr)
+                    logger.debug("Checking %s potential report cards.", count)
                     for i in range(count):
                         c = all_cards_loc.nth(i)
                         card_text = c.text_content() or ""
                         clean_text = " ".join(card_text.split())
-                        print(f"DEBUG:   Card {i} text: '{clean_text}'", file=sys.stderr)
                         if normalized_name in clean_text.lower():
                             card = c
                             logger.info(f"Found report card using flexible text matching at index {i}.")
                             break
 
                 if not card:
-                    print(f"DEBUG: Current URL: {page.url}", file=sys.stderr)
-                    print(f"DEBUG: Page Title: {page.title()}", file=sys.stderr)
+                    logger.debug("No matching report card was visible.")
                     self._take_screenshot(page, "allocations_report_not_found")
-                    # Try to find ANY text that looks like reports
-                    try:
-                        all_text = page.locator("body").text_content()
-                        print(f"DEBUG: Page Text (first 1000 chars): {all_text[:1000]}", file=sys.stderr)
-                    except Exception:
-                        pass
                     raise FileNotFoundError(f"Could not find report '{report_name}'.")
 
                 card.click()

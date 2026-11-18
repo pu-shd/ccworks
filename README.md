@@ -8,6 +8,10 @@ It supports two modes of interaction:
 
 ---
 
+For the managed Windows and macOS ChatGPT Work pilot, see the
+[desktop setup guide](docs/desktop-setup.md) and the
+[IT pilot and packaging runbook](docs/desktop-pilot.md).
+
 ## 🛠️ Prerequisites
 
 ### For API-Based Access
@@ -445,7 +449,7 @@ If you use Pi within this repository, it will automatically discover the extensi
 ### Client resilience and event reporting follow-ups
 
 Development candidate and live-validation policy:
-[December 1 validation and release gate](docs/live-validation-2026-12-01.md).
+[Live validation and release gate](docs/live-validation-2026-12-01.md).
 Development CI is separate from the live test and owner approval required before
 the next version and Homebrew update can ship.
 

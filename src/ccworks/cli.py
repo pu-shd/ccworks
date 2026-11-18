@@ -17,9 +17,6 @@ def signal_handler(sig, frame):
     logging.info(f"Signal {sig} received. Cleaning up and exiting...")
     sys.exit(128 + int(sig))
 
-signal.signal(signal.SIGHUP, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
-
 from ccworks import __version__
 from ccworks.client import ConcurClient, ConcurError
 from ccworks.browser_client import ConcurBrowserClient, ConcurSessionExpiredError
@@ -32,7 +29,7 @@ def handle_session_expired(e):
     print(f"\n[SESSION EXPIRED] {str(e)}", file=sys.stderr)
     
     # Only offer interactive login if we are in a TTY
-    if sys.stdin.isatty():
+    if not getattr(sys, "frozen", False) and sys.stdin.isatty():
         try:
             sys.stderr.write("\nWould you like to run the login command now? (y/N): ")
             sys.stderr.flush()
@@ -41,8 +38,10 @@ def handle_session_expired(e):
                 print("\nLaunching browser for login...", file=sys.stderr)
                 client = ConcurBrowserClient()
                 run_login(client, browser=os.environ.get("CCWORKS_LOGIN_BROWSER", "chromium"))
-                print("\n[INFO] Login complete. Resuming your previous command...\n", file=sys.stderr)
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                print(
+                    "\n[INFO] Login complete. Read the saved Concur state before retrying any interrupted write.",
+                    file=sys.stderr,
+                )
         except (EOFError, KeyboardInterrupt):
             print("\nLogin skipped.", file=sys.stderr)
     
@@ -444,7 +443,8 @@ def build_parser():
 
 def run_tests():
     # Load .env file
-    load_dotenv()
+    if not getattr(sys, "frozen", False):
+        load_dotenv()
 
     # Hard break on the retired flat command names. Scan the original argv
     # (before the global-flag hoisting below) so `--output text query` resolves
@@ -1558,6 +1558,9 @@ def run_tests():
 
 
 def main():
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     run_tests()
 
 

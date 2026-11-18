@@ -5,6 +5,8 @@ fresh indices and requested values. Run commands through an argument-vector
 execution API when available; never interpolate report names, paths or text
 into shell syntax. If the host accepts only shell text, quote every argument
 with its shell's proper escaping. Global flags precede the resource group.
+In a desktop Work session, replace the `ccworks` shown below with the absolute
+helper path from the skill and use `desktop check` for readiness.
 
 ## Inspect and authenticate
 
@@ -17,11 +19,12 @@ ccworks --output json report show "Statement Report" --deep
 ccworks --output json txn allocations "Statement Report"
 ```
 
-Login requires an interactive terminal: retain the running process while the
-user signs in, then send ENTER to it. A message saying “dashboard” is permission
-to finish this login handoff, not report submission approval. The CLI verifies
-headless saved-session reuse; check `session status` again in another invocation.
-Keep default private state storage or the user's configured `CCWORKS_STATE_DIR`.
+The two `session` commands above are for developers. Keep the interactive
+developer login process open until the user sees the dashboard and presses
+Enter. Then verify with a separate `session status` invocation. Desktop users
+complete sign-in or recovery in **ccworks Desktop** from Start or Finder. After
+they see **Ready**, rerun `desktop check`. Sign-in confirmation does not authorize
+report submission.
 
 `report show` uses 1-based expense indices. `txn allocations` uses section numbers;
 correlate using expense identity rather than assuming these numbers coincide.
