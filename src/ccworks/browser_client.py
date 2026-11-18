@@ -2107,7 +2107,8 @@ class ConcurBrowserClient:
                                 "[data-nuiexp='sal-btn-buttonbar-remove']")
     ALLOCATION_SAVE_BUTTON = ("[data-nuiexp='allocation-modal-save'], "
                               "[data-nuiexp='sal-btn-allocation-modal-save']")
-    ALLOCATION_ADD_CONFIRM = "[data-nuiexp='Ct-add-btn'], [data-nuiexp='At-add-btn']"
+    ALLOCATION_ADD_CONFIRM = ("[data-nuiexp='Ct-add-btn'], [data-nuiexp='At-add-btn'], "
+                              "[data-nuiexp='It-add-btn']")
 
     def _wait_for_allocations_ready(self, page):
         """Wait for allocation data or an explicit empty state, never a toolbar."""

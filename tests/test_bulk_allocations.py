@@ -87,6 +87,17 @@ class TestBulkAllocations(unittest.TestCase):
             [bool(t.get("allocations")) for t in txs],
         )
 
+    def test_live_allocation_form_controls_save_and_skip_on_rerun(self):
+        self.seed(options={"it_allocation_controls": True})
+        result = self.apply(transaction_indices=[0])
+        self.assertTrue(result["success"], result)
+        self.assertEqual(1, result["updated"])
+        repeated = self.apply(transaction_indices=[0])
+        self.assertTrue(repeated["success"], repeated)
+        self.assertEqual(0, repeated["updated"])
+        self.assertEqual(1, repeated["skipped"])
+        self.assertEqual(1, self.report()["allocation_write_count"])
+
     def test_conflicting_or_split_allocations_abort_before_any_write(self):
         self.seed(options={"seed_conflicting_allocation": True})
         result = self.apply()
