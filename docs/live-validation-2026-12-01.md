@@ -6,10 +6,12 @@ that report with the development client, independently verify the saved state,
 and record the owner's release approval. CI success alone does not satisfy the
 live test.
 
-The installed Homebrew release and `main` remain at 0.7.1 during development.
-Do not create a new version tag, publish a release, merge this candidate to
-`main`, or update the Homebrew formula before the gate passes. Do not create a
-fabricated production report or modify the already submitted November report.
+Development changes can merge to `main` after CI. Follow this gate before
+creating a release tag, publishing a release, or updating the Homebrew formula.
+The owner approved one-time exceptions for the Apple Silicon v0.8.0 and Windows
+x64 v0.8.1 installers. Each approval is recorded under its release tag.
+Use the full live gate for future releases. Use the report designated by the
+owner and leave already submitted reports alone.
 
 ## Scope and evidence
 
