@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "eligible_from": "2026-12-01",
+  "eligible_from": "2026-11-18",
   "status": "pending",
   "candidate_commit": null,
   "validated_at": null,
