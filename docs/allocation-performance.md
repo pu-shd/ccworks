@@ -1,15 +1,28 @@
 # Allocation performance — work plan
 
-Allocation is **91% of the cost of a reconciliation pass** and is the reason a
-teardown plus a re-apply cannot fit inside one Concur session. This is the plan
-for reducing it, and the constraints any change has to respect.
+Replacing an allocation is about 91% of the cost of a reconciliation pass. It is
+why a teardown plus a re-apply cannot fit in one Concur session (#3). This plan
+reduces that cost without weakening verification.
 
-Nothing here is implemented. It is written down so the next person (or the next
-session) starts from the measurements rather than re-deriving them.
+Nothing here is implemented. Refreshed November 2026 against the code at
+`fd00ec5`; the original plan was written in August 2026.
+
+## Scope
+
+`txn allocate-bulk` (`src/ccworks/bulk_allocations.py`) now handles a common
+chartstring across fresh expenses. It skips expenses that already match and
+stops on any conflicting allocation, so it never replaces one.
+
+This plan covers the remaining slow path: **replacing** an allocation on an
+expense, which happens in:
+
+- `report apply-json` rows with an `allocation` key, which clear and then add in
+  one browser session (`apply_json_updates` in `src/ccworks/browser_client.py`);
+- `txn unallocate` followed by `txn allocate`, two separate commands.
 
 ## Where the time goes
 
-Measured against a live 16-row statement, per transaction:
+Measured against a live 16-row statement in August 2026, per transaction:
 
 | Phase | Cost | Share |
 | :--- | ---: | ---: |
@@ -17,107 +30,112 @@ Measured against a live 16-row statement, per transaction:
 | Allocation — clear, then add | ~103s | 91% |
 | **Total** | **~113s** | |
 
-A 16-row statement is therefore ~30 min with allocations and ~3 min without.
-The allocation-only re-run measured **103s per row**, consistently, across 15
-consecutive rows (11:44:27 → 11:46:10 → 11:47:53 → 11:49:35).
+A 16-row statement takes ~30 min with allocations and ~3 min without. The
+allocation-only re-run measured 103 s per row across 15 consecutive rows. Allocation
+code has changed since (`cbbbf0c`, `476839d`), so re-measure before starting.
 
-Inside that 103s, the dominant cost is **two full report reloads**:
+The dominant cost is still **two full report reloads per row**, and the code
+paths are unchanged:
 
-- `_clear_allocations_on_page` verifies by calling `_verify_allocations_cleared`,
-  which navigates to `/nui/expense`, waits for the dashboard, re-opens the
-  report, and re-opens the allocations modal.
-- `_add_allocation_on_page` then verifies by calling `_verify_allocation`, which
-  does the same again.
-
-Each reload is a dashboard wait plus a report open plus a modal open. Two of
-them, back to back, per row.
+- `_clear_allocations_on_page` verifies through `_verify_allocations_cleared`,
+  which navigates to `/nui/expense`, waits for the dashboard, reopens the
+  report and reopens the allocations modal.
+- `_add_allocation_on_page` reopens the modal itself, then verifies through
+  `_verify_allocation`, which does the same full reload again.
 
 ## Why it is built that way
 
-The verification is not decoration. It exists because of a specific defect:
-`txn allocate` **adds** rather than replaces, so allocating an already-allocated
-expense splits it by percentage — a live row ended up 50/50 across two
-chartstrings while *both* writes reported success. The clear step's verification
-is what guarantees the old chartstring is actually gone before the new one is
-added.
+`txn allocate` **adds** rather than replaces. Allocating an already-allocated
+expense splits it: a live row ended up 50/50 across two chartstrings while both
+writes reported success. The clear step's verification guarantees the old
+chartstring is gone before the new one is added.
 
-Any change here is changing verification semantics on a financial write. That is
-the bar to clear.
+The final check is weaker than it looks. `_verify_allocation` passes when any
+one allocation row contains each requested value as a substring. It does not
+check the row count or the percentage, and fund `A0001` would also match
+`A00012`. Only the clear step's separate check catches a leftover split.
+
+Any change here changes verification on a financial write. That is the bar.
 
 ## Proposed work, in order
 
-### 1. Collapse the intermediate verification (largest win)
+### 1. Replace in one modal session and verify once (largest win)
 
-When clear and add run **back to back in the same pass**, the intermediate
-verification is arguably redundant: the final verification confirms the end
-state, and the end state is what matters. Verify once, after the add, asserting:
+When a replacement runs as one operation:
 
-- exactly **one** allocation row is present, and
-- it carries every requested value (dept, fund, and program when given).
+1. open the allocations modal once;
+2. replace the existing allocation. Prefer editing the existing 100% row in
+   place, so an interruption cannot leave the expense unallocated. Whether
+   Concur's current SAL dialog supports an in-place edit is not yet known and must
+   be checked live. Otherwise remove and add in the same modal session;
+3. save once, then verify once in a fresh read of the report.
 
-That assertion is strictly stronger than what is checked today, because today's
-final check does not assert the *count*. A leftover allocation from a failed
-clear would currently pass the add's verification (the new chartstring is
-present) and be caught only by the clear's own check.
+The single verification must assert the end state with the bulk path's
+`is_full_allocation` rule: **exactly one** allocation, at **100%** in percent
+mode, containing every requested code as a whole code, plus any preserved
+chartstring defaults. This is strictly stronger than today's final check.
 
-Expected: ~103s → ~55s per row; a 16-row pass from ~30 min to ~16 min.
+Expected: about half the per-row cost (~103 s → ~55 s; a 16-row pass from
+~30 min to ~16 min). Confirm live.
 
-Keep `remove_transaction_allocations` (the standalone `txn unallocate`)
-verifying independently — there is no subsequent add to confirm the end state.
+`txn unallocate` on its own keeps its independent verification; no later add
+confirms its end state.
 
-### 2. Do not re-open the modal between clear and add
+This item supersedes the "in-place, verified replacement" item in
+[client resilience follow-ups](client-resilience-followups.md).
 
-`_clear_allocations_on_page` and `_add_allocation_on_page` each call
-`_open_allocations_modal`. Run back to back, the modal is already open after the
-clear. Detect that and skip the second open.
+### 2. Reduce redundant row collection
 
-Expected: a few seconds per row. Small, but it also removes one opportunity for
-the post-save re-render race that broke every row of the first one-shot.
+`_collect_expense_rows` runs several times per row: after each per-row report
+reload in `apply_json_updates`, inside `_open_allocations_modal`, and again in
+each verification. Each call is a full DOM scan. Reuse the result within a row
+while the page has demonstrably not navigated. The gain is small but compounds.
 
-### 3. Reduce redundant row collection
+### 3. Verify allocations in one sweep per report
 
-`_collect_expense_rows` runs 3–4 times per row: once in the write loop, once per
-retry attempt in `_open_allocations_modal`, and again inside each verification.
-Each is a full DOM scan (18 candidates filtered to 16). Cache within a row where
-the page has demonstrably not navigated.
+`apply-json` must reload the report before every row after the first. Closing
+the detail pane leaves the previous row's receipt viewer in the DOM, so a stale
+row would otherwise claim the wrong receipt. That reload stays.
 
-Expected: small, but it compounds across 16 rows.
-
-### 4. Consider a per-report allocation pass
-
-`apply-json` currently reloads the report before every row (necessary — a stale
-viewer otherwise attributes one expense's receipt to the next). If allocations
-were applied in a second sweep after all the field writes, the reload could be
-amortised. This is speculative and should only be attempted after 1–3 are
-measured.
+Allocation verification can be amortised instead. `BulkAllocator._verify` already
+re-reads every selected expense in one fresh browser context after the writes.
+Apply the same pattern to `apply-json`: write allocations per row, then verify
+them all in one sweep and report each row's result. Attempt this only after
+item 1 is measured, and keep the identity guards and `remaining_indices`
+checkpoints.
 
 ## Constraints
 
-- **Verification cannot be weakened.** The end state must still be asserted
-  against a fresh read of what Concur holds, not the modal left on screen. The
-  measurable requirement is that the deep verification after a full pass still
-  reports `complete: true`, `failures: 0`.
-- **A partial failure must be reported.** If the clear succeeds and the add
-  fails, the row must fail loudly — it is now *unallocated*, which is worse than
-  when it started.
+- **Verification cannot be weakened.** Assert the end state against a fresh read
+  of what Concur holds, never the modal left on screen. After a full pass,
+  `report show --deep` must still report `complete: true` and `failures: 0`.
+- **Report partial failure loudly.** If the old allocation is removed but the new
+  one fails, the expense is now unallocated, which is worse than before. Fail the
+  row and say so.
+- **Re-read before retrying.** A child Add Allocation save can persist before the
+  parent dialog closes. After a timeout or interrupted dialog, read the
+  allocations before retrying, or a retry can create a duplicate split.
 - **The mock cannot validate the gain.** Its timings are unrelated to Concur's.
-  Correctness is testable in the suite; the speedup is only measurable live.
+  Correctness is testable in the suite; speed only live.
 
 ## How to verify a change here
 
-1. Suite green (`unittest discover -s tests`), including
-   `tests/test_allocations_crud.py`.
-2. A live before/after on one row, comparing the `Updating Row N` timestamps in
-   a `-v` log.
-3. A full pass on a 16-row statement, then `report show --deep`, asserting
-   `complete: true`, `failures: 0`, and the expected chartstring on every row.
-4. `scratchpad/timing.py`-style parsing of the verbose log to produce the new
-   per-row median, and update the figures in `README.md` and the skill doc.
+1. The suite passes in Docker (`docker-compose run --rm unit-tests`), including
+   `tests/test_allocations_crud.py`, with new regressions for a leftover split,
+   a non-100% allocation, a code that is a prefix of another, and a removal that
+   succeeds while the add fails.
+2. Compare one row live, before and after, using the `Updating Row N` timestamps
+   in a `-v` log.
+3. Run a full pass on a 16-row statement, then `report show --deep`. Assert
+   `complete: true`, `failures: 0` and the expected chartstring on every row.
+4. Update the per-row figures in `README.md` ("Monthly reconciliation") and in
+   this plan if they change.
 
 ## Related
 
-- Session lifetime (#3). The Concur JWT is ~60 minutes from login and is **not**
-  extended by use — measured: across a 24-minute run the session file's mtime
-  advanced while the JWT expiry did not move. Halving allocation cost is what
-  would make a teardown *and* a re-apply fit one session, so this work is the
-  practical mitigation for that issue.
+- Session lifetime (#3, open). The Concur JWT lasts ~60 minutes from login and is
+  not extended by use: across a 24-minute run the session file's modification
+  time advanced while the JWT expiry did not. Halving allocation cost is what
+  would let a teardown and a re-apply fit in one session.
+- [Client resilience follow-ups](client-resilience-followups.md): phase
+  deadlines, checkpoints and structured events also apply to this work.
