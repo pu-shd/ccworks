@@ -33,9 +33,10 @@ required live validation:
   partial completion when fields and a receipt save but allocation replacement
   fails; resume only the unfinished stage after reading it back.
 - Prefer an in-place, verified replacement of an existing 100% allocation so an
-  interruption cannot leave a gap between clearing and adding. For bulk
-  replacements, group only expenses with the same requested codes and preserved
-  chartstring defaults, and checkpoint each verified group.
+  interruption cannot leave a gap between clearing and adding. Tracked with its
+  performance work in [Allocation performance](allocation-performance.md), item 1.
+  For bulk replacements, group only expenses with the same requested codes and
+  preserved chartstring defaults, and checkpoint each verified group.
 - Emit structured, redacted events for operation, phase, expense index, retry,
   elapsed time, overlay/confirmation handling, session budget, and outcome.
   Distinguish saved-with-warning, unknown, failed, and verified outcomes. Do not
