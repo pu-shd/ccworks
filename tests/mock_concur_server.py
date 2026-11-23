@@ -112,6 +112,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="allocations-modal" style="display:none; position:absolute; top:120px; left:120px;
          background:white; border:1px solid #c9c9c9; padding:20px; z-index:4000; width:420px;">
         <h3>Allocations</h3>
+        <ul id="allocation-units"><li role="option" aria-selected="true">Percent</li>
+            <li role="option" aria-selected="false">Amount</li></ul>
         <!-- .allocation-grid-container and per-row checkboxes mirror the live
              grid: clearing an allocation means ticking rows and pressing
              Remove, which is the only way to replace a chartstring since Add
@@ -119,16 +121,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="allocation-grid-container"><div id="allocations-list"></div></div>
         <button type="button" data-nuiexp="allocations-addBtn" onclick="showAddAllocation()">Add</button>
         <button type="button" data-nuiexp="allocations-removeBtn" onclick="removeCheckedAllocations()">Remove</button>
-        <div id="add-allocation-form" style="display:none; margin-top:12px;">
+        <div id="add-allocation-form" data-nuiexp="Ut-modal" style="display:none; margin-top:12px;">
             <div id="alloc-field-custom6"></div>
             <div id="alloc-field-custom7"></div>
             <div id="alloc-field-custom8"></div>
             <button type="button" data-nuiexp="Ct-add-btn" onclick="saveAddAllocation()">Save</button>
+            <button type="button" data-nuiexp="At-cancel-btn"
+                    onclick="document.getElementById('add-allocation-form').style.display='none'">Cancel</button>
         </div>
         <div style="margin-top:12px;">
             <button type="button" data-nuiexp="allocation-modal-save"
                     onclick="saveAllocations()">Save</button>
-            <button type="button" onclick="closeAllocations()">Cancel</button>
+            <button type="button" data-nuiexp="sal-btn-allocation-modal-cancel" onclick="closeAllocations()">Cancel</button>
         </div>
         <div id="alloc-popup" class="sapcnqr-overlay__dialog" style="display:none; background:white;
              border:1px solid #c9c9c9; padding:6px; z-index:5000;">
@@ -149,6 +153,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <p><strong>Comment:</strong> <span id="detail-comment"></span></p>
         
         <h3>Expenses (Line Items)</h3>
+        <button type="button" onclick="openBulkAllocations()">Allocate</button>
         <div id="detail-expenses-list">
             <!-- Dynamically populated -->
         </div>
@@ -295,6 +300,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 card.innerHTML = `
                     <div class="report-info">
                         <span class="report-name">${r.name}</span>
+                        <span class="report-status">${r.status || 'Draft'}</span>
                         <span class="report-purpose">(${r.purpose || 'No Purpose'})</span>
                         <p style="margin: 5px 0 0 0; font-size:12px; color:#5c646b;">Comment: ${r.comment || 'None'}</p>
                     </div>
@@ -305,6 +311,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         `}
                     </div>
                 `;
+                if ((r.mock_options || {}).status_delay_ms) {
+                    const status = card.querySelector('.report-status');
+                    status.textContent = 'Loading';
+                    setTimeout(() => status.textContent = r.status || 'Draft', r.mock_options.status_delay_ms);
+                }
                 container.appendChild(card);
             });
         }
@@ -395,8 +406,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                                    aria-label="View receipt">&#128220;</button>`
                         : '';
                     row.innerHTML = `
-                        <div class="sapMCb" style="width:20px; height:20px; border:1px solid #ccc; margin-right:5px;"></div>
+                        <input type="checkbox" class="expense-select sapMCb" data-index="${idx}"
+                               onclick="event.stopPropagation()" aria-label="Select expense row ${idx + 1}">
                         <div style="display:none;">Select expense</div>
+                        <span style="display:none;">Merchant: ${t.merchant} |</span>
+                        <span data-nuiexp="expense-type-cell">${t.expense_type || ''}</span>
+                        ${t.date ? `<span>${t.date}</span>` : ''}
                         <div style="width: 120px; font-weight: bold;" class="recon-merchant">${t.merchant} (${t.amount})</div>
                         <div style="display: flex; flex-direction: column; font-size: 11px;">
                             ${t.reconciled ? '<span style="color: green; font-weight: bold;" class="recon-status">✓ Reconciled</span>' : '<span style="color: red;" class="recon-status">Pending</span>'}
@@ -455,8 +470,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const idx = selectedTxIdx;
             const pane = document.getElementById('sapcnqr-layout-side-panel-elements');
             const content = document.getElementById('detail-pane-content');
+            const report = reportsData.find(r => r.name === selectedReportName);
+            if (report && report.mock_options && report.mock_options.sticky_editor
+                    && pane.dataset.rowIdx && pane.dataset.rowIdx !== String(idx)) {
+                pane.style.display = 'block';
+                return; // A previous expense's editor survived closing.
+            }
+            pane.dataset.rowIdx = String(idx);
             
             content.innerHTML = `
+                <input data-nuiexp="field-vendorName" id="vendorName" readonly value="${t.merchant}">
+                <input data-nuiexp="field-transactionAmount" id="transactionAmount" readonly value="${t.amount.replace('$', '')}">
+                ${t.date ? `<input data-nuiexp="field-transactionDate" readonly value="${t.date}">` : ''}
                 <div class="form-group">
                     ${renderExpenseTypeField(t, idx)}
                 </div>
@@ -509,7 +534,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             custom7: [["(A0001) General Fund", ""], ["(B0002) Sponsored Research", ""]],
             custom8: [["(P999) Research", ""], ["(P100) Teaching", ""]]
         };
-        let allocIdx = -1, allocDraft = {}, allocActiveField = null;
+        let allocIdx = -1, allocDraft = {}, allocActiveField = null, allocTargets = [];
 
         // The grid is still re-rendering just after an expense pane is saved, so
         // the row menu's contents are not there the instant the kebab is clicked.
@@ -538,11 +563,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             m.style.display = m.style.display === 'block' ? 'none' : 'block';
         }
 
+        function openBulkAllocations() {
+            const selected = [...document.querySelectorAll('.expense-select:checked')]
+                .map(e => Number(e.dataset.index));
+            if (!selected.length) return;
+            openAllocations(selected[0]);
+            allocTargets = selected;
+        }
+
         function openAllocations(idx) {
+            allocTargets = [idx];
             allocIdx = idx;
             allocDraft = {};
+            const report = reportsData.find(r => r.name === selectedReportName);
+            const sal = !!(report && report.mock_options && report.mock_options.sal_allocations);
+            for (const option of document.querySelectorAll('#allocation-units [role="option"]')) {
+                const selected = (option.textContent === 'Amount') === !!report.mock_options.amount_mode;
+                option.setAttribute('aria-selected', String(selected));
+            }
+            const modal = document.getElementById('allocations-modal');
+            modal.setAttribute('data-nuiexp', sal ? 'sal-dialog-allocations' : '');
+            let background = document.getElementById('background-allocation-list');
+            if (sal && !background) {
+                background = document.createElement('div');
+                background.id = 'background-allocation-list';
+                background.className = 'sapMListUl';
+                background.textContent = 'Unrelated background list';
+                document.body.prepend(background);
+            }
+            for (const [legacy, current] of [
+                ['allocations-addBtn', 'sal-btn-buttonbar-add'],
+                ['allocations-removeBtn', 'sal-btn-buttonbar-remove'],
+                ['allocation-modal-save', 'sal-btn-allocation-modal-save'],
+            ]) {
+                const button = document.querySelector(`[data-nuiexp="${legacy}"], [data-nuiexp="${current}"]`);
+                if (button) button.setAttribute('data-nuiexp', sal ? current : legacy);
+            }
+            const form = document.getElementById('add-allocation-form');
+            const useItControls = sal && report.mock_options.it_allocation_controls;
+            form.querySelector('button[onclick="saveAddAllocation()"]').setAttribute(
+                'data-nuiexp', useItControls ? 'It-add-btn' : (sal ? 'At-add-btn' : 'Ct-add-btn'));
+            form.querySelector('button[data-nuiexp$="-cancel-btn"]').setAttribute(
+                'data-nuiexp', useItControls ? 'It-cancel-btn' : 'At-cancel-btn');
             toggleRowMenu(idx);
-            document.getElementById('add-allocation-form').style.display = 'none';
+            form.style.display = 'none';
             document.getElementById('allocations-modal').style.display = 'block';
             renderAllocationsList();
         }
@@ -572,7 +636,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 + 'Select all rows DepartmentSort column ascendingCodeSort column ascending</div>';
             list.innerHTML = header + rows.map((a, i) =>
                 `<div role="row" class="sapMLIB"><input type="checkbox" class="alloc-row-box"
-                     data-i="${i}"> Select row ${a.custom6 || ''} ${a.custom7 || ''} ${a.custom8 || ''}</div>`
+                     data-i="${i}"> Select row ${a.custom6 || ''} ${a.custom7 || ''} ${a.custom8 || ''}
+                     <input data-nuiexp="spend-common__amount-input" aria-label="Percentage"
+                            value="${a.percentage || '100'}" oninput="currentAllocations()[${i}].percentage=this.value"></div>`
             ).join('');
         }
 
@@ -594,6 +660,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function showAddAllocation() {
+            const report = reportsData.find(r => r.name === selectedReportName);
+            allocDraft = Object.assign({}, report.transactions[allocIdx].default_chartstring || {});
             document.getElementById('add-allocation-form').style.display = 'block';
             ['custom6', 'custom7', 'custom8'].forEach(renderAllocField);
         }
@@ -647,24 +715,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             renderAllocField(allocActiveField);
         }
 
-        function saveAddAllocation() {
+        async function saveAddAllocation() {
             if (!allocDraft.custom6 && !allocDraft.custom7) return;
             const r = reportsData.find(x => x.name === selectedReportName);
-            const t = r && (r.transactions || [])[allocIdx];
-            if (t) {
-                t.allocations = (t.allocations || []).concat([Object.assign({}, allocDraft)]);
+            for (const index of allocTargets) {
+                const t = r.transactions[index];
+                t.allocations = (t.allocations || []).concat([
+                    Object.assign({percentage: '100'}, allocDraft)]);
+            }
+            if (r.mock_options.child_save_persists) await persistAllocationTargets();
+            if (r.mock_options.missing_parent_save) {
+                document.querySelector('[data-nuiexp="sal-btn-allocation-modal-save"]').remove();
             }
             document.getElementById('add-allocation-form').style.display = 'none';
             allocDraft = {};
             renderAllocationsList();
         }
 
-        async function saveAllocations() {
+        async function persistAllocationTargets() {
             await fetch('/api/reports/allocate', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({report_name: selectedReportName, index: allocIdx,
+                body: JSON.stringify({report_name: selectedReportName, indices: allocTargets,
                                       allocations: currentAllocations()})
             });
+        }
+
+        async function saveAllocations() {
+            const report = reportsData.find(r => r.name === selectedReportName);
+            if (!report.mock_options.child_save_persists) await persistAllocationTargets();
             const res = await fetch('/api/reports');
             reportsData = await res.json();
             closeAllocations();
@@ -736,6 +814,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function renderTypeOptions(idx, filter) {
+            const report = reportsData.find(r => r.name === selectedReportName);
+            const delay = report && report.mock_options && report.mock_options.picker_delay_ms;
+            const token = window.__typeQuery = (window.__typeQuery || 0) + 1;
+            if (delay) {
+                setTimeout(() => { if (token === window.__typeQuery) drawTypeOptions(idx, filter); }, delay);
+            } else {
+                drawTypeOptions(idx, filter);
+            }
+        }
+
+        function drawTypeOptions(idx, filter) {
             const box = document.getElementById('type-listbox');
             if (!box) return;
             const q = (filter || '').toLowerCase();
@@ -913,6 +1002,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const business_purpose = document.getElementById(`businessPurpose`).value;
             const comment = document.getElementById(`recon-comment`).value;
             const allocation_code = document.getElementById(`recon-allocation-${idx}`).value;
+            const report = reportsData.find(r => r.name === reportName);
+            const opts = (report && report.mock_options) || {};
+            if (opts.save_delay_ms) await new Promise(resolve => setTimeout(resolve, opts.save_delay_ms));
+            if (opts.reject_save) {
+                showSaveDialog('<div>Error</div><div>Before you can continue, you must '
+                    + 'provide valid information for:</div><div>Business Purpose</div>'
+                    + '<button type="button" onclick="closeSaveDialog()">Close</button>');
+                return;
+            }
 
             // Expense type is required. A report named ...REQTYPE enforces it, so
             // the rest of the suite can keep saving rows that have no type.
@@ -964,6 +1062,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 showReportDetails(updatedReport);
             }
             delayRowMenus(1800);
+            if (opts.saved_warning) {
+                showSaveDialog('<div>Error</div><div>This expense has been saved, but it is '
+                    + 'missing required information or has an error that needs to be resolved '
+                    + 'before the report can be submitted. Would you like to make corrections now?</div>'
+                    + '<button type="button" onclick="closeSaveDialog()">Yes</button>'
+                    + '<button type="button" onclick="closeSaveDialog(); closeTransactionDetail()">No</button>');
+                return;
+            }
             closeTransactionDetail();
         }
 
@@ -987,15 +1093,110 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }
         }
 
-        async function submitReport(reportName) {
-            await fetch('/api/reports/submit', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ report_name: reportName })
-            });
-            alert('Report submitted successfully!');
-            closeReportDetails();
-            fetchReports();
+        async function submitReport() {
+            // Real Concur does not submit on this click. It opens a
+            // report-totals confirmation as a full-screen overlay, and the
+            // report stays in draft until the dialog's own button is clicked.
+            // The toolbar button remains in the DOM behind the overlay and
+            // still matches button:has-text('Submit Report'), which is what
+            // made a page-wide .first locator resolve to the covered button
+            // and time out.
+            const reportName = selectedReportName;
+            const report = reportsData.find(r => r.name === reportName);
+            const options = (report && report.mock_options) || {};
+            if (options.native_submit_flow) {
+                showNativeSubmitDialog(reportName, false);
+                return;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.id = 'report-totals-overlay';
+            overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.35); z-index:9000; display:flex; align-items:center; justify-content:center;';
+
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'dialog');
+            dialog.setAttribute('aria-modal', 'true');
+            dialog.setAttribute('data-nuiexp', 'report-totals-modal');
+            dialog.className = 'sapcnqr-dialog report-totals-modal sapcnqr-dialog__fade sapcnqr-dialog__fade--in';
+            dialog.style.cssText = 'background:white; border-radius:6px; padding:25px; width:380px;';
+            dialog.innerHTML = '<h3>Report Totals</h3><p>Amount Due Employee: <strong>$0.00</strong></p>';
+
+            const confirmBtn = document.createElement('button');
+            confirmBtn.className = 'button';
+            confirmBtn.id = 'totals-modal-submit-btn';
+            confirmBtn.setAttribute('data-nuiexp', 'reportTotalsModal.submitButton');
+            confirmBtn.style.cssText = 'background:#0070d2; color:white; margin-right:10px;';
+            confirmBtn.innerText = 'Submit Report';
+            confirmBtn.onclick = async () => {
+                await fetch('/api/reports/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ report_name: reportName })
+                });
+                overlay.remove();
+                closeReportDetails();
+                fetchReports();
+            };
+
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'button';
+            cancelBtn.innerText = 'Cancel';
+            cancelBtn.style.cssText = 'background:#e0e5ea;';
+            cancelBtn.onclick = () => { overlay.remove(); };
+
+            dialog.appendChild(confirmBtn);
+            dialog.appendChild(cancelBtn);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+        }
+
+        function showNativeSubmitDialog(reportName, agreement) {
+            const report = reportsData.find(r => r.name === reportName);
+            const options = (report && report.mock_options) || {};
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:#7778;z-index:9500;display:grid;place-items:center';
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'dialog');
+            dialog.setAttribute('aria-modal', 'true');
+            dialog.setAttribute('data-nuiexp', agreement
+                ? 'exp-dlg-confirmation-agreement-modal' : 'erp-dlg-report-summary');
+            dialog.style.cssText = 'background:white;padding:30px';
+            dialog.innerHTML = agreement
+                ? '<h3>User Submit</h3><p>I certify this is a true and accurate accounting of expenses. All required receipt images have been attached.</p>'
+                : '<h3>Report Summary</h3><p>Review the report before proceeding.</p>';
+            const cancel = document.createElement('button');
+            cancel.textContent = 'Cancel';
+            cancel.onclick = () => overlay.remove();
+            dialog.appendChild(cancel);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+            setTimeout(() => {
+                const action = document.createElement('button');
+                action.textContent = agreement ? 'Accept & Submit' : 'Proceed';
+                action.setAttribute('data-nuiexp', agreement
+                    ? 'accept-and-create-button' : 'erp-btn-summary-footer-submit');
+                action.onclick = async () => {
+                    if (!agreement) {
+                        overlay.remove();
+                        showNativeSubmitDialog(reportName, true);
+                        return;
+                    }
+                    if (!options.drop_submission) {
+                        await fetch('/api/reports/submit', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({report_name: reportName})
+                        });
+                    }
+                    overlay.remove();
+                    if (options.lose_submit_ack) {
+                        location.reload();
+                        return;
+                    }
+                    closeReportDetails();
+                    await fetchReports();
+                };
+                dialog.appendChild(action);
+            }, options.submit_action_delay_ms || 0);
         }
 
         function closeReportDetails() {
@@ -1328,7 +1529,15 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
             # shipments booked the same day for the same amount. ccworks used to
             # deduplicate rows by their text content and silently drop the second.
             # Keyed off the name so existing tests' row counts are unaffected.
-            if "DUPES" in name:
+            if "BATCHTYPES" in name:
+                transactions = [
+                    {"id": f"BATCH-{i}", "merchant": f"Vendor {i}",
+                     "amount": f"${10+i}.00", "date": "06/12/2026",
+                     "expense_type": "Lodging", "business_purpose": "Keep purpose",
+                     "comment": "Keep comment", "allocation_code": "", "reconciled": False}
+                    for i in range(1, 7)
+                ]
+            elif "DUPES" in name:
                 transactions = [
                     {"id": "TX_DUP_1", "merchant": "ESHIPGLOBAL INC", "amount": "$53.77", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False},
                     {"id": "TX_DUP_2", "merchant": "ESHIPGLOBAL INC", "amount": "$53.77", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False},
@@ -1352,12 +1561,24 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
                     {"id": "TX_REP_1", "merchant": "Uber", "amount": "$24.50", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False},
                     {"id": "TX_REP_2", "merchant": "Office Depot", "amount": "$189.99", "expense_type": "", "business_purpose": "", "comment": "", "allocation_code": "", "reconciled": False}
                 ]
+            if "transactions" in data:
+                transactions = data["transactions"]
+            options = data.get("mock_options", {})
+            if options.get("different_programs"):
+                for index, transaction in enumerate(transactions):
+                    transaction["default_chartstring"] = {"custom8": "P999" if index < 3 else "FC631"}
+            if options.get("seed_conflicting_allocation") or options.get("seed_matching_allocation"):
+                fund = "A0006" if options.get("seed_conflicting_allocation") else "A0001"
+                transactions[-1]["allocations"] = [{"custom6": "25605", "custom7": fund, "percentage": "100"}]
+            if data.get("mock_options", {}).get("duplicate_identity"):
+                transactions[1].update({key: transactions[0][key] for key in ("merchant", "amount", "date")})
             REPORTS.append({
                 "name": name,
                 "purpose": purpose,
                 "comment": comment,
                 "status": "Draft",
                 "transactions": transactions,
+                "mock_options": data.get("mock_options", {}),
             })
             
             self.send_response(201)
@@ -1372,6 +1593,9 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
                 if r["name"] == report_name:
                     txs = r.get("transactions", [])
                     if 0 <= tx_idx < len(txs):
+                        txs[tx_idx]["save_count"] = txs[tx_idx].get("save_count", 0) + 1
+                        if r.get("mock_options", {}).get("drop_save"):
+                            continue
                         txs[tx_idx]["expense_type"] = data.get("expense_type", "")
                         txs[tx_idx]["business_purpose"] = data.get("business_purpose", "")
                         txs[tx_idx]["comment"] = data.get("comment", "")
@@ -1384,15 +1608,13 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
 
         elif self.path == "/api/reports/allocate":
-            report_name = data.get("report_name")
-            tx_idx = data.get("index")
-            allocations = data.get("allocations") or []
-            for r in REPORTS:
-                if r["name"] == report_name:
-                    txs = r.get("transactions", [])
-                    if 0 <= tx_idx < len(txs):
-                        txs[tx_idx]["allocations"] = allocations
-
+            for report in REPORTS:
+                if report["name"] != data.get("report_name"):
+                    continue
+                report["allocation_write_count"] = report.get("allocation_write_count", 0) + 1
+                if not report.get("mock_options", {}).get("drop_allocation_save"):
+                    for index in data.get("indices", [data.get("index")]):
+                        report["transactions"][index]["allocations"] = data.get("allocations") or []
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1424,6 +1646,7 @@ class MockConcurRequestHandler(BaseHTTPRequestHandler):
             for r in REPORTS:
                 if r["name"] == report_name:
                     r["status"] = "Submitted"
+                    r["submit_count"] = r.get("submit_count", 0) + 1
             
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

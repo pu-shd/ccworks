@@ -8,20 +8,19 @@ import itertools
 import time
 import logging
 import signal
+from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
 # Configure signal handling for graceful exit
 def signal_handler(sig, frame):
     logging.info(f"Signal {sig} received. Cleaning up and exiting...")
-    sys.exit(0)
-
-signal.signal(signal.SIGHUP, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
+    sys.exit(128 + int(sig))
 
 from ccworks import __version__
 from ccworks.client import ConcurClient, ConcurError
 from ccworks.browser_client import ConcurBrowserClient, ConcurSessionExpiredError
+from ccworks.safari_login import run_login
 
 
 def handle_session_expired(e):
@@ -30,7 +29,7 @@ def handle_session_expired(e):
     print(f"\n[SESSION EXPIRED] {str(e)}", file=sys.stderr)
     
     # Only offer interactive login if we are in a TTY
-    if sys.stdin.isatty():
+    if not getattr(sys, "frozen", False) and sys.stdin.isatty():
         try:
             sys.stderr.write("\nWould you like to run the login command now? (y/N): ")
             sys.stderr.flush()
@@ -38,9 +37,11 @@ def handle_session_expired(e):
             if choice == 'y':
                 print("\nLaunching browser for login...", file=sys.stderr)
                 client = ConcurBrowserClient()
-                client.run_headed_login()
-                print("\n[INFO] Login complete. Resuming your previous command...\n", file=sys.stderr)
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                run_login(client, browser=os.environ.get("CCWORKS_LOGIN_BROWSER", "chromium"))
+                print(
+                    "\n[INFO] Login complete. Read the saved Concur state before retrying any interrupted write.",
+                    file=sys.stderr,
+                )
         except (EOFError, KeyboardInterrupt):
             print("\nLogin skipped.", file=sys.stderr)
     
@@ -68,6 +69,8 @@ class Spinner:
         sys.stderr.flush()
 
     def __enter__(self):
+        if not sys.stderr.isatty() or getattr(sys, "frozen", False):
+            return self
         self.running = True
         self.thread = threading.Thread(target=self.spin)
         self.thread.start()
@@ -138,6 +141,7 @@ _COMMAND_MAP = {
     ("txn", "unallocate"): "unallocate",
     ("txn", "detach-receipt"): "detach-receipt",
     ("txn", "allocate"): "add-allocation",
+    ("txn", "allocate-bulk"): "bulk-allocation",
     ("txn", "attach-receipt"): "attach-receipt",
     ("card", "list"): "list-cards",
     ("card", "show"): "card-details",
@@ -170,7 +174,7 @@ def split_incomplete_expenses(expenses, data):
     return safe, withheld
 
 
-def _legacy_command(args) -> str:
+def _legacy_command(args) -> Optional[str]:
     """Map the parsed group/subcommand onto the dispatcher's command token."""
     group = getattr(args, "group", None)
     if group == "nuke":
@@ -180,6 +184,8 @@ def _legacy_command(args) -> str:
         return "list-old-reports" if args.historical else "query"
     if (group, sub) == ("report", "delete"):
         return "delete-all-reports" if args.all_drafts else "delete-report"
+    if group is None or sub is None:
+        return None
     return _COMMAND_MAP.get((group, sub))
 
 
@@ -199,6 +205,7 @@ def _command_reference() -> str:
         ("txn update",            "Update transactions by 1-based index [--type --justification ...]"),
         ("txn allocations",       "List chartstring allocations for a report [--view F]"),
         ("txn allocate",          "Add a chartstring to a transaction (--dept --fund [--prog])"),
+        ("txn allocate-bulk",     "Set common 100% allocations (--all | --indices N...) [--dry-run]"),
         ("txn attach-receipt",    "Attach a local receipt file (--merchant --file)"),
         ("card", None),
         ("card list",             "List credit-card transactions [--view F]"),
@@ -358,6 +365,16 @@ def build_parser():
                          help="Fund (e.g. '(A0001) General Fund')")
     t_alloc.add_argument("--prog", type=str, help="Program (e.g. '(P999) Research')")
 
+    t_bulk = txn.add_parser("allocate-bulk", help="Set a common 100% allocation using native bulk selection")
+    t_bulk.add_argument("report_name", help="Name of the expense report")
+    selection = t_bulk.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--all", action="store_true", help="Select every expense in the report")
+    selection.add_argument("--indices", type=int, nargs="+", help="Select these 1-based expense indices")
+    t_bulk.add_argument("--dept", required=True, help="Department code")
+    t_bulk.add_argument("--fund", required=True, help="Fund code")
+    t_bulk.add_argument("--prog", help="Program code; omit to preserve existing defaults")
+    t_bulk.add_argument("--dry-run", action="store_true", help="Read and validate the selection without saving")
+
     t_unalloc = txn.add_parser("unallocate",
                                help="Clear every allocation on a transaction")
     t_unalloc.add_argument("report_name", type=str, help="Name of the expense report")
@@ -408,7 +425,12 @@ def build_parser():
 
     # ---------------- session ----------------
     session = add_group("session", "Authentication session")
-    session.add_parser("login", help="Launch a headed browser for manual authentication")
+    login = session.add_parser("login", help="Launch a browser and verify saved authentication")
+    login.add_argument("--browser", dest="login_browser", choices=("chromium", "safari", "auto"),
+                       default=None, help="Interactive browser (default: CCWORKS_LOGIN_BROWSER or chromium). "
+                       "Safari and auto are experimental and incomplete for Concur SSO.")
+    login.add_argument("--no-fallback", action="store_true",
+                       help="Fail if Safari cannot export a session usable by Playwright")
     session.add_parser("status", help="Check whether the saved session is still valid")
 
     # ---------------- api ----------------
@@ -423,7 +445,8 @@ def build_parser():
 
 def run_tests():
     # Load .env file
-    load_dotenv()
+    if not getattr(sys, "frozen", False):
+        load_dotenv()
 
     # Hard break on the retired flat command names. Scan the original argv
     # (before the global-flag hoisting below) so `--output text query` resolves
@@ -500,6 +523,10 @@ def run_tests():
     if (args.group, sub) == ("receipt", "delete") and not args.all_receipts:
         parser.error("`receipt delete` requires --all (there is no per-receipt delete)")
 
+    if (args.group, sub) == ("txn", "allocate-bulk") and args.indices is not None:
+        if any(i < 1 for i in args.indices) or len(set(args.indices)) != len(args.indices):
+            parser.error("--indices must contain unique positive 1-based indices")
+
     # Normalize the new surface onto the dispatcher's internal command tokens.
     args.command = _legacy_command(args)
     if args.command is None:  # unreachable unless a parser lacks a mapping
@@ -524,12 +551,23 @@ def run_tests():
         l.propagate = True
 
     def output_result(data, text_summary=None):
+        failed = isinstance(data, dict) and data.get("success") is False
         if args.output == "json":
+            print(json.dumps(data, indent=2))
+        elif failed:
+            print("[FAILED] Operation did not complete successfully.")
             print(json.dumps(data, indent=2))
         elif text_summary:
             print(text_summary)
+            if isinstance(data, dict) and "updated" in data:
+                print(f"Updated: {data['updated']}; unchanged: {data.get('skipped', 0)}; "
+                      f"failed: {data.get('failed', 0)}")
+                for warning in data.get("warnings", []):
+                    print(f"[WARNING] {warning}")
         else:
             print(json.dumps(data, indent=2))
+        if failed:
+            sys.exit(1)
 
     # ----------------------------------------------------
     # Command Dispatcher
@@ -657,9 +695,13 @@ def run_tests():
             
             try:
                 browser_client = ConcurBrowserClient()
-                browser_client.run_headed_login()
+                login_result = run_login(
+                    browser_client,
+                    browser=args.login_browser or os.environ.get("CCWORKS_LOGIN_BROWSER", "chromium"),
+                    fallback=not args.no_fallback,
+                )
                 
-                result = {"status": "success", "message": "Manual login setup complete."}
+                result = {"status": "success", "message": "Login and headless session reuse verified.", **login_result}
                 summary = "\n[SUCCESS] Setup complete. You can now run browser-based automations.\nTo create a draft report, use: ccworks report create"
                 output_result(result, summary)
             except ConcurSessionExpiredError as e:
@@ -990,13 +1032,14 @@ def run_tests():
                 with Spinner(f"Fetching allocations for '{args.report_name}'..."):
                     browser_client = ConcurBrowserClient()
                     data = browser_client.get_report_allocations(args.report_name, filter_view=args.filter_view, headless=True)
-                    print(json.dumps(data, indent=2))
+                    output_result(data)
             except ConcurSessionExpiredError as e:
 
                 handle_session_expired(e)
 
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
     
         # ----------------------------------------------------
         # Flow J3: Add Allocation
@@ -1022,6 +1065,7 @@ def run_tests():
                 handle_session_expired(e)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
 
         elif args.command == "unallocate":
             try:
@@ -1044,6 +1088,26 @@ def run_tests():
                 handle_session_expired(e)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
+
+        elif args.command == "bulk-allocation":
+            try:
+                with Spinner("Checking bulk allocations..."):
+                    browser_client = ConcurBrowserClient()
+                    res = browser_client.set_report_allocations(
+                        report_name=args.report_name,
+                        department=args.dept,
+                        fund=args.fund,
+                        program=args.prog,
+                        transaction_indices=None if args.indices is None else [i - 1 for i in args.indices],
+                        dry_run=args.dry_run,
+                        headless=True,
+                    )
+                output_result(res)
+            except ConcurSessionExpiredError as e:
+                handle_session_expired(e)
+            except Exception:
+                output_result({"success": False, "error": "Bulk allocation failed; inspect saved state before retrying"})
 
         elif args.command == "add-allocation":
             try:
@@ -1072,6 +1136,7 @@ def run_tests():
                 handle_session_expired(e)
             except Exception as e:
                 print(json.dumps({"status": "error", "message": str(e)}))
+                sys.exit(1)
     
         # ----------------------------------------------------
         # Flow K: List Card Transactions
@@ -1332,9 +1397,11 @@ def run_tests():
                     )
                 
                 success_count = sum(1 for r in res.get("results", []) if r["success"])
-                summary = f"\n[SUCCESS] Updated {success_count}/{len(tx_indices)} transactions successfully!\n"
+                summary = (f"\n[SUCCESS] Processed {len(tx_indices)} transactions.\n" if "updated" in res
+                           else f"\n[SUCCESS] Updated {success_count}/{len(tx_indices)} transactions successfully!\n")
                 for r in res.get("results", []):
-                    status = "OK" if r["success"] else f"FAILED ({r.get('error')})"
+                    status = (r.get("status", "OK").upper() if r["success"]
+                              else f"FAILED ({r.get('error')})")
                     if r.get("validation_error"):
                         status += f" (WARNING: {r['validation_error']})"
                     elif r.get("note"):
@@ -1410,9 +1477,18 @@ def run_tests():
                     browser_client = ConcurBrowserClient()
                     res = browser_client.submit_report(report_name=report_name_val, headless=True)
                 
-                summary = f"\n[SUCCESS] Successfully submitted report: '{report_name_val}'\n"
+                # submit_report returns success=False when it clicked but could
+                # not verify the report left draft. Printing [SUCCESS] for that
+                # is how an unsubmitted report gets reported as submitted.
+                if res.get("success"):
+                    summary = f"\n[SUCCESS] Successfully submitted report: '{report_name_val}'\n"
+                else:
+                    summary = (f"\n[WARNING] Submit was clicked but could not be verified for "
+                               f"'{report_name_val}'. Check the report in Concur.\n")
                 summary += "=" * 60
                 output_result(res, summary)
+                if not res.get("success"):
+                    sys.exit(1)
             except ConcurSessionExpiredError as e:
                 handle_session_expired(e)
             except Exception as e:
@@ -1445,10 +1521,10 @@ def run_tests():
 
                 if not args.include_incomplete:
                     expenses, withheld = split_incomplete_expenses(expenses, data)
-                    for e in withheld:
+                    for withheld_expense in withheld:
                         print(
-                            f"[SKIP] index {e.get('index')} ({e.get('vendor')} "
-                            f"{e.get('amount')}): captured incompletely "
+                            f"[SKIP] index {withheld_expense.get('index')} ({withheld_expense.get('vendor')} "
+                            f"{withheld_expense.get('amount')}): captured incompletely "
                             f"(deep scan failed), so its fields are not safe to write. "
                             f"Re-run `report show --deep` or pass --include-incomplete.",
                             file=sys.stderr,
@@ -1484,6 +1560,9 @@ def run_tests():
 
 
 def main():
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     run_tests()
 
 

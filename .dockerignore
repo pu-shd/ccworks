@@ -1,0 +1,14 @@
+.git
+.venv
+node_modules
+__pycache__
+**/__pycache__
+.mypy_cache
+.ruff_cache
+.claude
+**/.ccworks-state
+.env*
+concur_session*.json
+screenshots
+build
+dist

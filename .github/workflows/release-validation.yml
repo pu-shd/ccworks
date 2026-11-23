@@ -1,0 +1,28 @@
+name: Release validation
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  live-validation-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require live validation and explicit release approval
+        env:
+          PYTHONPATH: src
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements-dev.lock
+          .venv/bin/python -m ccworks.release_validation --require-live --tag "$RELEASE_TAG"

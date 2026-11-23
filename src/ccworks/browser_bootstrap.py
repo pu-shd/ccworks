@@ -7,31 +7,98 @@ touch a user cache, we detect the missing binary on first browser use and
 install it then, with a TTY prompt when interactive.
 """
 
+import json
 import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("ccworks.browser_bootstrap")
 
 _chromium_verified = False
 
+# What `playwright install chromium` puts on disk. Headless launches use the
+# separate headless-shell build, so a registry holding only the full chromium
+# is still incomplete for our default (headless) code paths.
+_REQUIRED_BROWSERS = ("chromium", "chromium-headless-shell")
+
+
+def _browsers_registry() -> Optional[Path]:
+    """Directory Playwright unpacks browser builds into, or None if unknown.
+
+    Mirrors Playwright's own registry rules: PLAYWRIGHT_BROWSERS_PATH wins,
+    with the documented "0" meaning "inside the package"; otherwise the
+    per-platform user cache.
+    """
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env == "0":
+        try:
+            import playwright
+        except ImportError:
+            return None
+        return Path(playwright.__file__).parent / "driver" / "package" / ".local-browsers"
+    if env:
+        return Path(env)
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        return base / "ms-playwright"
+    cache = os.environ.get("XDG_CACHE_HOME")
+    return (Path(cache) if cache else Path.home() / ".cache") / "ms-playwright"
+
 
 def _chromium_installed() -> bool:
-    """Return True if Playwright's chromium binary is present on disk."""
+    """Return True if Playwright's chromium builds are unpacked on disk.
+
+    Deliberately a filesystem check and not `sync_playwright().chromium
+    .executable_path`. That probe answers the same question but starts (and
+    immediately stops) the Node driver, and on Python 3.14 a connection that
+    never launched a browser tears down noisily -- every ccworks command
+    trailed its JSON with `Task was destroyed but it is pending!`, a
+    `Future exception was never retrieved`, and a TargetClosedError traceback
+    on stderr. Nothing was actually wrong, but the output looked like a crash
+    and polluted stderr for callers parsing it.
+
+    Being wrong here is cheap in one direction only, so it fails toward
+    installing: a false "missing" costs a re-run of `playwright install
+    chromium`, which is a no-op in well under a second when the builds are
+    already there.
+    """
     try:
-        from playwright.sync_api import sync_playwright
+        import playwright
     except ImportError:
         return False
 
-    try:
-        with sync_playwright() as p:
-            exe = p.chromium.executable_path
-    except Exception:
+    registry = _browsers_registry()
+    if registry is None:
         return False
 
-    return bool(exe) and Path(exe).exists()
+    manifest = Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
+    try:
+        revisions = {
+            b["name"]: b["revision"] for b in json.loads(manifest.read_text())["browsers"]
+        }
+    except Exception as exc:
+        logger.debug(f"_chromium_installed: unreadable {manifest}: {exc!r}")
+        return False
+
+    for name in _REQUIRED_BROWSERS:
+        revision = revisions.get(name)
+        if revision is None:  # older Playwright without this build; not required
+            continue
+        # Registry layout is `<name with dashes as underscores>-<revision>`,
+        # with INSTALLATION_COMPLETE written last -- so a download killed
+        # halfway reads as missing rather than usable.
+        build = registry / f"{name.replace('-', '_')}-{revision}"
+        if not (build / "INSTALLATION_COMPLETE").exists():
+            logger.debug(f"_chromium_installed: {build} is absent or incomplete")
+            return False
+
+    return True
 
 
 def _install_chromium() -> None:

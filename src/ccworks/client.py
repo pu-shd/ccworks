@@ -108,7 +108,7 @@ class ConcurClient:
         API reference: GET /api/v3.0/expense/reports
         """
         url = f"{self.base_url}/api/v3.0/expense/reports"
-        params = {
+        params: Dict[str, Any] = {
             "user": user_login_id,
             "limit": limit
         }

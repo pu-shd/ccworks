@@ -1,26 +1,66 @@
 import sys
 import os
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import time
 from datetime import datetime
 import logging
-import contextlib
 import re
-from typing import Any, Dict, List, Optional, Union
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
+from urllib.parse import urlsplit
+from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
 
 from ccworks import paths
 from ccworks.browser_bootstrap import ensure_chromium
+from ccworks.browser_launch import BrowserLaunch, driver_temp_environment
+from ccworks.session_state import save_state_atomically, session_lock
+from ccworks.operation_events import RedactedBrowserDiagnostics
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ConcurBrowserClient")
+logger.addFilter(RedactedBrowserDiagnostics())
+
+
+SIGN_IN_MESSAGE = (
+    "Open ccworks Desktop, choose Sign in to Concur, and complete sign-in in the browser. "
+    "Then return to this chat."
+)
 
 
 class ConcurSessionExpiredError(RuntimeError):
     """Exception raised when the Concur session has expired and requires re-login."""
     pass
+
+
+def verify_dashboard_session(page: Any, base_url: str) -> None:
+    """Confirm both a reachable dashboard and a usable first-party JWT."""
+    from ccworks.safari_login import SafariLoginError, _require_auth_state, _trusted_host
+
+    response = page.goto(f"{base_url}/nui/expense", timeout=15000)
+
+    def require_authenticated_page() -> None:
+        final = urlsplit(page.url)
+        if (
+            final.scheme != urlsplit(base_url).scheme
+            or not _trusted_host(base_url, final.hostname)
+            or re.search(r"(?:login|sign.?in)", final.path, re.IGNORECASE)
+            or (response is not None and response.status in (401, 403))
+        ):
+            raise ConcurSessionExpiredError(SIGN_IN_MESSAGE)
+        try:
+            _require_auth_state({"cookies": page.context.cookies()}, base_url)
+        except SafariLoginError:
+            raise ConcurSessionExpiredError(SIGN_IN_MESSAGE) from None
+
+    require_authenticated_page()
+    try:
+        page.locator(
+            ".no-reports, .report-card, .report-tile, .cnqr-report-card, .sapMCard"
+        ).filter(visible=True).first.wait_for(state="visible", timeout=15000)
+    finally:
+        require_authenticated_page()
 
 
 class ConcurBrowserClient:
@@ -29,14 +69,22 @@ class ConcurBrowserClient:
     def __init__(
         self,
         session_file: Optional[str] = None,
-        base_url: str = "https://www.concursolutions.com"
+        base_url: str = "https://www.concursolutions.com",
+        *,
+        browser_launch: Optional[BrowserLaunch] = None,
+        desktop: Optional[bool] = None,
     ):
-        self.session_file = session_file if session_file else str(paths.session_file())
+        self.desktop = bool(getattr(sys, "frozen", False)) if desktop is None else desktop
+        self.browser_launch = browser_launch or BrowserLaunch.from_environment(desktop=self.desktop)
+        self.session_file = session_file or str(paths.session_file(desktop=self.desktop))
         self.base_url = base_url.rstrip("/")
-        self.screenshot_dir = str(paths.screenshot_dir())
-        ensure_chromium()
+        self.screenshot_dir = "" if self.desktop else str(paths.screenshot_dir())
+        if self.browser_launch.kind == "playwright":
+            ensure_chromium()
 
     def _take_screenshot(self, page: Any, label: str) -> None:
+        if self.desktop:
+            return
         # Include PID to prevent interference between concurrent runs
         pid = os.getpid()
         path = os.path.join(self.screenshot_dir, f"{label}_{pid}.png")
@@ -83,7 +131,7 @@ class ConcurBrowserClient:
         exposes or accepts.
         """
         candidates = page.locator(", ".join(self.EXPENSE_ROW_SELECTORS)).all()
-        diagnostics = {"candidates_seen": len(candidates), "skipped": []}
+        diagnostics: Dict[str, Any] = {"candidates_seen": len(candidates), "skipped": []}
         logger.info(f"Discovered {len(candidates)} potential expense line item(s) using broad selectors.")
 
         rows = []
@@ -213,6 +261,16 @@ class ConcurBrowserClient:
                           "[data-nuiexp='receipt-body'], "
                           "[data-nuiexp='receipt-viewer-metadata'], #upload-receipt-button")
 
+    # Legacy confirmation selectors. The current native summary/certification
+    # stages and independent status verification live in ccworks.submission.
+    SUBMIT_CONFIRM_DIALOG = ("[data-nuiexp='report-totals-modal'], "
+                             ".report-totals-modal, "
+                             "[role='dialog'][aria-modal='true']")
+    SUBMIT_CONFIRM_BUTTON = ("button:has-text('Submit Report'), "
+                             ".sapMBtn:has-text('Submit Report'), "
+                             "button:has-text('Accept & Submit'), "
+                             "button:has-text('Submit')")
+
     # One definition of the editable fields on an expense, shared by every write
     # path. These were duplicated per-caller, and the copies drifted: one grew a
     # read-back check and a re-focus after clearing, the others did not, so the
@@ -245,69 +303,106 @@ class ConcurBrowserClient:
         "button[data-nuiexp='save-button']",
     )
 
-    def _click_save_expense(self, page, ctx=None):
-        """Save the open expense. Returns (saved, error).
+    EXPENSE_EDITOR_FIELDS = ("[data-nuiexp='field-expenseType'], "
+                             "[data-nuiexp='field-type'], select.recon-type, input[id*='type']")
+    SAVE_DIALOGS = (".sapcnqr-message-dialog, .sapcnqr-dialog, [role='alertdialog'], "
+                    ".sapMDialog, .sapMMessageBox, [role='dialog']")
+    EXPENSE_PANE = ("#sapcnqr-layout-side-panel-elements, "
+                    ".sapcnqr-layout-side-panel__elements, .ere__dynamic-main-content")
 
-        Only one of the three copies this replaces checked for the validation
-        dialog Concur raises when it rejects a save; the others treated the click
-        itself as proof and reported a rejected save as a successful one.
+    def _close_expense_editor(self, page):
+        """Cancel an open editor and wait for it to close, without saving."""
+        fields = page.locator(self.EXPENSE_EDITOR_FIELDS).filter(visible=True)
+        if fields.count() == 0:
+            return True
+        pane = page.locator(self.EXPENSE_PANE).filter(visible=True).first
+        scope = pane if pane.count() else page
+        native_close = page.locator("[data-nuiexp='close-full-screen-panel']").filter(visible=True)
+        cancel = scope.get_by_role("button", name=re.compile(r"^(Cancel|Close)$", re.I)).first
+        try:
+            if native_close.count() == 1:
+                native_close.click(timeout=3000)
+            elif native_close.count() > 1:
+                return False
+            elif cancel.count():
+                cancel.click(timeout=3000)
+            else:
+                return False
+            expect(fields).to_have_count(0, timeout=3000)
+            return True
+        except (PlaywrightTimeoutError, AssertionError):
+            return False
+
+    def _click_save_expense(self, page, ctx=None, warnings=None):
+        """Return (saved, error), appending submission-readiness warnings.
+
+        Wait for a dialog or the editor closing. A saved draft can still carry
+        submission errors; it must not be retried as though the write failed.
+        The type-only batch also verifies the persisted values after saving.
         """
         scope = ctx if ctx is not None else page
+        btn = None
         for sel in self.SAVE_BUTTON_SELECTORS:
-            try:
-                btn = scope.locator(sel).first
-                if btn.count() == 0 or not btn.is_visible():
+            candidate = scope.locator(sel).filter(visible=True).first
+            if candidate.count():
+                btn = candidate
+                break
+        if btn is None:
+            return False, "Could not find Save button"
+        try:
+            expect(btn).to_be_enabled(timeout=5000)
+            btn.click(timeout=5000)
+            for _ in range(4):
+                page.wait_for_function("""({dialogs, fields}) => {
+                    const visible = el => el.getClientRects().length > 0;
+                    return [...document.querySelectorAll(dialogs)].some(visible)
+                        || ![...document.querySelectorAll(fields)].some(visible);
+                }""", arg={"dialogs": self.SAVE_DIALOGS, "fields": self.EXPENSE_EDITOR_FIELDS},
+                    timeout=15000)
+                dialog = page.locator(self.SAVE_DIALOGS).filter(visible=True).first
+                if not dialog.count():
+                    return True, None
+                dialog_node = dialog.element_handle()
+                if dialog_node is None:
                     continue
-                try:
-                    btn.wait_for_element_state("enabled", timeout=3000)
-                except Exception:
-                    pass
-                btn.click(force=True)
-                page.wait_for_timeout(2500)
-
-                # Concur's dialogs are .sapcnqr-message-dialog with
-                # role="alertdialog". The old locator looked for .sapMDialog /
-                # [role='dialog'], matched neither, and so reported a save that
-                # Concur had refused as a successful one.
-                dialog = page.locator(
-                    ".sapcnqr-message-dialog, .sapcnqr-dialog, [role='alertdialog'], "
-                    ".sapMDialog, .sapMMessageBox, [role='dialog']"
-                ).filter(visible=True).first
-                if dialog.count() > 0:
-                    text = " ".join((dialog.text_content() or "").split())
-
-                    # "Update Other Items?" asks whether to propagate the change
-                    # into this expense's itemizations and allocations. Until it
-                    # is answered the save does not commit, so leaving it on
-                    # screen silently discarded the edit. "Do Not Update" saves
-                    # the expense-level change and leaves allocations' own text
-                    # alone, which is the narrower of the two.
-                    if "Update Other Items" in text:
-                        choice = dialog.locator(
-                            "button:has-text('Do Not Update')").filter(visible=True).first
-                        if choice.count() == 0:
-                            return False, ("save raised 'Update Other Items?' but no "
-                                           "'Do Not Update' button was found")
-                        choice.click()
-                        page.wait_for_timeout(2500)
-                        logger.info(f"  Saved via {sel} (declined itemization update)")
-                        return True, None
-
-                    if re.search(r"Error|provide valid information|must provide", text, re.I):
-                        msg = text[:180]
-                        close = dialog.locator(
-                            "button:has-text('Close'), button:has-text('OK')").first
-                        if close.count() > 0:
-                            close.click()
-                        else:
-                            page.keyboard.press("Escape")
-                        return False, f"save rejected by Concur: {msg}"
-
-                logger.info(f"  Saved via {sel}")
-                return True, None
-            except Exception:
-                continue
-        return False, "Could not find Save button"
+                text = " ".join((dialog.text_content() or "").split())
+                if "Update Other Items" in text:
+                    # Previously modified allocations produce an informational
+                    # acknowledgment instead of the propagation question. Both
+                    # variants can render their actions after the dialog body.
+                    acknowledgment = (
+                        "These changes will not overwrite previously modified allocations."
+                        in text and "Update them manually." in text
+                    )
+                    action = "Acknowledge" if acknowledgment else "Do Not Update"
+                    choice = dialog.get_by_role("button", name=action, exact=True)
+                    expect(choice).to_have_count(1, timeout=5000)
+                    choice.click(timeout=5000)
+                    page.wait_for_function("el => !el.isConnected || !el.getClientRects().length",
+                                           arg=dialog_node, timeout=5000)
+                    continue
+                if re.search(r"\bexpense\s+has\s+been\s+saved\b", text, re.I):
+                    choice = dialog.get_by_role("button", name=re.compile(r"^(No|Close|OK)$", re.I)).first
+                    if not choice.count():
+                        return False, "Saved-draft warning has no dismiss control"
+                    choice.click()
+                    page.wait_for_function("el => !el.isConnected || !el.getClientRects().length",
+                                           arg=dialog_node, timeout=5000)
+                    if warnings is not None:
+                        warnings.append(text)
+                    self._close_expense_editor(page)
+                    return True, None
+                if re.search(r"Error|provide valid information|must provide", text, re.I):
+                    close = dialog.get_by_role("button", name=re.compile(r"^(Close|OK)$", re.I)).first
+                    if close.count():
+                        close.click()
+                    else:
+                        page.keyboard.press("Escape")
+                    return False, f"save rejected by Concur: {text[:180]}"
+                return False, f"Unrecognized save confirmation: {text[:180]}"
+            return False, "Save confirmations did not finish"
+        except Exception as exc:
+            return False, f"Could not confirm expense save: {exc}"
 
     def _read_select_field(self, ctx, field_key, label, native_extra=""):
         """The value a Concur select/combobox field currently shows, or None.
@@ -351,7 +446,7 @@ class ConcurBrowserClient:
         if native.count() > 0:
             try:
                 native.select_option(label=value)
-                page.wait_for_timeout(500)
+                expect(native).to_have_value(re.compile(re.escape(value), re.I), timeout=5000)
             except Exception as e:
                 return f"failed to select {label} {value!r}: {e}"
         else:
@@ -361,14 +456,20 @@ class ConcurBrowserClient:
             try:
                 trigger = page.locator(f"[data-nuiexp='field-{field_key}__trigger']").first
                 (trigger if trigger.count() > 0 else field).click(force=True)
-                page.wait_for_timeout(900)
 
                 search = page.locator(f"[data-nuiexp='field-{field_key}__input']").first
-                if search.count() == 0:
-                    return f"{label} picker did not open for {value!r}"
+                search.wait_for(state="visible", timeout=5000)
                 search.click()
                 search.fill(value)
-                page.wait_for_timeout(1200)
+                page.wait_for_function("""({popup, query}) => {
+                    const box = [...document.querySelectorAll(popup)]
+                        .find(el => el.getClientRects().length);
+                    if (!box) return false;
+                    if (/no match|no results|nothing found/i.test(box.textContent)) return true;
+                    const opts = [...box.querySelectorAll('[role=option]')];
+                    return opts.length > 0 && opts.every(el =>
+                        el.textContent.toLowerCase().includes(query.toLowerCase()));
+                }""", arg={"popup": self.SELECT_POPUP, "query": value}, timeout=5000)
 
                 # Option labels carry the value followed by its description
                 # ("Computer Peripherals (OIT use only)Accessories like..."), so
@@ -410,7 +511,8 @@ class ConcurBrowserClient:
                     return f"{label} {value!r} was not offered by the picker"
                 target = options.nth(chosen)
                 target.click(force=True)
-                page.wait_for_timeout(1500)
+                expect(search).to_be_hidden(timeout=5000)
+                expect(field).to_contain_text(re.compile(re.escape(value), re.I), timeout=5000)
             except Exception as e:
                 return f"failed to set {label} {value!r}: {e}"
 
@@ -488,6 +590,219 @@ class ConcurBrowserClient:
             if err:
                 errors.append(err)
         return errors
+
+    @staticmethod
+    def _type_only_payload(expenses):
+        allowed = {"index", "vendor", "amount", "date", "expense_type", "type", "raw_text"}
+        return bool(expenses) and all(
+            isinstance(e, dict) and not set(e) - allowed
+            and isinstance(e.get("expense_type") or e.get("type"), str)
+            and bool((e.get("expense_type") or e.get("type")).strip())
+            for e in expenses)
+
+    @staticmethod
+    def _update_summary(results):
+        warnings = list(dict.fromkeys(w for r in results for w in r.get("warnings", [])))
+        return {
+            "success": all(r["success"] for r in results),
+            "updated": sum(r["success"] and r.get("status", "updated") == "updated" for r in results),
+            "skipped": sum(r["success"] and r.get("status") == "skipped" for r in results),
+            "failed": sum(not r["success"] for r in results),
+            "warnings": warnings,
+            "ready_to_submit": False if warnings else None,
+            "results": results,
+        }
+
+    def _row_expense_type(self, row):
+        """The grid's explicit type, without opening an editor or guessing a prefix."""
+        cell = row.locator("[data-nuiexp='expense-type-cell'], .expense-type-cell").first
+        if cell.count():
+            return " ".join((cell.text_content() or "").split()).strip()
+        text = " ".join((row.text_content() or "").split())
+        match = re.search(r"Select expense,\s*(.*?),\s*-?\$", text)
+        if not match:
+            match = re.search(r"Type:\s*(.*?)(?:\||$)", text)
+        return match.group(1).strip() if match else ""
+
+    def _load_type_report(self, page, report_name):
+        page.goto(f"{self.base_url}/nui/expense", wait_until="domcontentloaded", timeout=45000)
+        self._wait_for_dashboard(page)
+        self._open_report_by_name(page, report_name, settle=False)
+        page.wait_for_function("""selector => [...document.querySelectorAll(selector)]
+            .some(el => /Select expense|Date:.*Type:.*Amount:/.test(el.textContent)
+                || /no expenses/i.test(el.textContent))""",
+            arg=", ".join(self.EXPENSE_ROW_SELECTORS), timeout=10000)
+
+    def _wait_for_expense_identity(self, page, row_text):
+        """Require the editor's vendor, amount, and available date to match the grid.
+
+        In particular, an editor remaining visible is not evidence that it
+        belongs to the newly selected row. Missing identity fields fail closed.
+        """
+        amount = re.search(r"-?\s*\$\s*-?[\d,]+\.\d{2}", row_text)
+        date = re.search(r"\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}", row_text)
+        if not amount:
+            raise ValueError("Cannot verify an expense without its grid amount")
+        page.wait_for_function("""({text, amount, date}) => {
+            const field = selector => [...document.querySelectorAll(selector)]
+                .find(el => el.getClientRects().length);
+            const norm = s => s.replace(/\\s+/g, ' ').trim().toLowerCase();
+            const vendor = field("[data-nuiexp='field-vendorName'], input#vendorName");
+            const total = field("[data-nuiexp='field-transactionAmount'], input#transactionAmount");
+            if (!vendor || !total || !vendor.value || !total.value) return false;
+            if (!norm(text).includes(norm(vendor.value))) return false;
+            const money = s => Number(s.replace(/[^0-9.\\-]/g, ''));
+            if (money(total.value) !== money(amount)) return false;
+            if (date) {
+                const d = field("[data-nuiexp='field-transactionDate'], input#transactionDate");
+                if (!d || !d.value) return false;
+                const iso = s => { const p = s.split(/[\\/-]/);
+                    return p[0].length === 4 ? p.join('-') : [p[2], p[0], p[1]].join('-'); };
+                if (iso(d.value) !== iso(date)) return false;
+            }
+            return true;
+        }""", arg={"text": row_text, "amount": amount.group(0),
+                    "date": date.group(0) if date else None}, timeout=2000)
+
+    def _open_type_editor(self, page, report_name, index, row_text):
+        """Switch to a verified editor, retrying once after a fresh navigation."""
+        if not self._close_expense_editor(page):
+            self._load_type_report(page, report_name)
+        for attempt in range(2):
+            rows, _ = self._collect_expense_rows(page, report_name)
+            if index > len(rows) or " ".join((rows[index - 1].text_content() or "").split()) != row_text:
+                raise RuntimeError("Expense identity changed; capture the report again")
+            row = rows[index - 1]
+            row.scroll_into_view_if_needed()
+            row.click(timeout=5000)
+            fields = page.locator(self.EXPENSE_EDITOR_FIELDS).filter(visible=True)
+            if not fields.count():
+                edit = page.locator("[data-nuiexp='edit-button'], button:has-text('Edit'), "
+                                    "#edit-transaction-btn").filter(visible=True).first
+                if edit.count() and edit.is_enabled():
+                    edit.click(timeout=5000)
+            try:
+                self._wait_for_expense_identity(page, row_text)
+                pane = page.locator(self.EXPENSE_PANE).filter(visible=True).first
+                return pane if pane.count() else page
+            except PlaywrightTimeoutError:
+                if attempt == 0:
+                    self._load_type_report(page, report_name)
+        raise RuntimeError("Could not verify expense editor identity after reloading")
+
+    def _apply_type_updates(self, report_name, expenses, headless=True,
+                            ignore_session_budget=False, require_identity=True):
+        """Apply only expense types, skip exact matches, then verify one fresh report."""
+        indices = [e.get("index") for e in expenses]
+        if (not indices or any(type(i) is not int or i < 1 for i in indices)
+                or len(set(indices)) != len(indices)):
+            raise ValueError("Type updates require distinct positive integer indices")
+        for exp in expenses:
+            wanted = exp.get("expense_type") or exp.get("type")
+            if not isinstance(wanted, str) or not wanted.strip():
+                raise ValueError("Expense type must be a nonempty string")
+            if any(key in exp and not isinstance(exp[key], str) for key in ("vendor", "amount", "date")):
+                raise ValueError("Expense vendor, amount, and date must be strings")
+        results = []
+        plans = {}
+        with self._browser_page(headless=headless) as page:
+            self._load_type_report(page, report_name)
+            rows, _ = self._collect_expense_rows(page, report_name)
+            for exp in sorted(expenses, key=lambda e: e["index"]):
+                index = exp["index"]
+                if index > len(rows):
+                    results.append({"index": index, "success": False, "error": "Index out of bounds"})
+                    continue
+                row = rows[index - 1]
+                mismatch = self._row_identity_mismatch(row, exp) if require_identity else None
+                if mismatch:
+                    results.append({"index": index, "success": False,
+                                    "error": "Row does not match supplied expense: " + mismatch})
+                    continue
+                text = " ".join((row.text_content() or "").split())
+                amount = re.search(r"-?\s*\$\s*-?[\d,]+\.\d{2}", text)
+                # These fresh identity guards are used for the final read too.
+                identity = {k: exp[k] for k in ("vendor", "amount") if exp.get(k)}
+                if amount:
+                    identity["amount"] = amount.group(0)
+                date = re.search(r"\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}", text)
+                if exp.get("date") and exp["date"] not in text:
+                    results.append({"index": index, "success": False,
+                                    "error": "Row date does not match supplied expense"})
+                    continue
+                wanted = (exp.get("expense_type") or exp["type"]).strip()
+                plans[index] = {"text": text, "identity": identity, "type": wanted,
+                                "date": date.group(0) if date else None,
+                                "ambiguous": sum(not self._row_identity_mismatch(r, identity)
+                                                 for r in rows) > 1}
+
+            editor_used = False
+            for index, plan in plans.items():
+                result = {"index": index, "success": False, "saved": False, "verified": False}
+                results.append(result)
+                try:
+                    rows, _ = self._collect_expense_rows(page, report_name)
+                    if index > len(rows) or " ".join((rows[index - 1].text_content() or "").split()) != plan["text"]:
+                        raise RuntimeError("Expense identity changed before writing")
+                    current = self._row_expense_type(rows[index - 1])
+                    if current.casefold() == plan["type"].casefold():
+                        result.update(success=True, status="skipped", verified=True)
+                        continue
+                    left = self._session_minutes_left()
+                    if (not ignore_session_budget and left is not None
+                            and left * 60 < self.SECONDS_PER_ROW + 30):
+                        raise RuntimeError("Session budget too short; refresh authentication before retrying")
+                    # Equal merchant/amount/date rows cannot be distinguished
+                    # from a stale editor by those fields. Start them fresh.
+                    if plan["ambiguous"] and editor_used:
+                        self._load_type_report(page, report_name)
+                    editor_used = True
+                    ctx = self._open_type_editor(page, report_name, index, plan["text"])
+                    # The editor is also authoritative when the grid omitted its type.
+                    if (self._read_expense_type(ctx) or "").casefold() == plan["type"].casefold():
+                        result.update(success=True, status="skipped", verified=True)
+                        self._close_expense_editor(page)
+                        continue
+                    error = self._set_expense_type(page, ctx, plan["type"])
+                    if error:
+                        raise RuntimeError(error)
+                    warnings = []
+                    saved, error = self._click_save_expense(page, ctx, warnings=warnings)
+                    result["saved"] = saved
+                    if warnings:
+                        result.update(warnings=warnings, ready_to_submit=False)
+                    if not saved:
+                        raise RuntimeError(error or "Save was not confirmed")
+                    result.update(success=True, status="updated")
+                except ConcurSessionExpiredError:
+                    raise
+                except Exception as exc:
+                    result.update(success=False, status="failed", error=str(exc))
+                    self._close_expense_editor(page)
+
+            # A clean reload reads persisted data, including after a warning or
+            # an apparent save which the server silently discarded. No-op runs
+            # already have a fresh report and perform no additional navigation.
+            if any(r["saved"] for r in results if "saved" in r):
+                self._load_type_report(page, report_name)
+                rows, _ = self._collect_expense_rows(page, report_name)
+                for result in results:
+                    if not result["success"]:
+                        continue
+                    index = result["index"]
+                    plan = plans[index]
+                    mismatch = (index > len(rows) or self._row_identity_mismatch(
+                        rows[index - 1], plan["identity"]))
+                    if not mismatch and plan["date"]:
+                        mismatch = plan["date"] not in (rows[index - 1].text_content() or "")
+                    actual = self._row_expense_type(rows[index - 1]) if index <= len(rows) else ""
+                    if mismatch or actual.casefold() != plan["type"].casefold():
+                        result.update(success=False, status="failed", verified=False,
+                                      error="Expense type did not persist or expense identity changed")
+                    else:
+                        result["verified"] = True
+        results.sort(key=lambda r: r["index"])
+        return {"report_name": report_name, **self._update_summary(results)}
 
     def _wait_for_receipt_area(self, page, timeout=20000):
         """Block until the receipt panel has hydrated past its loading skeleton."""
@@ -685,10 +1000,12 @@ class ConcurBrowserClient:
                 err = self._detach_receipt_in_pane(page, ctx, transaction_index)
                 if err:
                     return {"success": False, "error": err}
-                saved, save_error = self._click_save_expense(page, ctx)
+                save_warnings: List[str] = []
+                saved, save_error = self._click_save_expense(page, ctx, warnings=save_warnings)
                 if not saved:
                     return {"success": False, "error": save_error}
-                return {"success": True}
+                return {"success": True, "saved": True, "warnings": save_warnings,
+                        "ready_to_submit": False if save_warnings else None}
             except Exception as e:
                 logger.error(f"Failed to detach receipt: {e}")
                 return {"success": False, "error": str(e)}
@@ -738,63 +1055,37 @@ class ConcurBrowserClient:
         except Exception as e:
             return f"receipt removal failed on row {idx}: {e}"
 
+    def _close_cookie_banner(self, page):
+        """Activate the site's normal close control without changing consent."""
+        overlay = page.locator("#trustarc-banner-overlay")
+        if not overlay.is_visible():
+            return
+        close = page.locator("#truste-consent-close")
+        expect(close).to_have_count(1, timeout=5000)
+        # The live close link can be outside the viewport. Activate that exact
+        # control; do not remove overlays or change preference/consent buttons.
+        close.evaluate("element => element.click()")
+        overlay.wait_for(state="hidden", timeout=5000)
+        from ccworks.operation_events import OperationEvents
+        OperationEvents("browser").emit("overlay", "handled")
+
     def _dismiss_modals(self, page):
-        """Aggressively dismisses common SAP Concur overlays."""
-        # 1. Timeline Modal / What's New
-        modals = page.locator("[data-nuiexp='timelineModal'], .sapcnqr-dialog__fade--in, [role='dialog'][aria-modal='true']").filter(visible=True)
-        if modals.count() > 0:
-            logger.info(f"Detected {modals.count()} visible modal(s). Attempting dismissal...")
-            
-            # Try Escape key first
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-            
-            # Try finding a Close/X button
-            close_buttons = [
-                "button:has-text('Close')", 
-                ".sapMBtn:has-text('Close')", 
-                "button[aria-label='Close']",
-                ".sapcnqr-icon--close"
-            ]
-            for selector in close_buttons:
-                btn = page.locator(selector).filter(visible=True).first
-                if btn.count() > 0:
-                    try:
-                        btn.click(force=True, timeout=2000)
-                        page.wait_for_timeout(1000)
-                        if modals.count() == 0:
-                            return
-                    except Exception:
-                        pass
+        """Close only recognized onboarding overlays, preserving business dialogs."""
+        known = page.locator("[data-nuiexp='timelineModal'], "
+                             ".vip-widgets__text-app-onboarding-dialog").filter(visible=True)
+        for root in reversed(known.all()):
+            close = root.get_by_role("button", name=re.compile(r"^(Close|Dismiss|Got it)$", re.I)).first
+            if close.count():
+                node = root.element_handle()
+                close.click(timeout=3000)
+                page.wait_for_function(
+                    "el => !el.isConnected || !el.getClientRects().length",
+                    arg=node, timeout=3000,
+                )
+        self._close_cookie_banner(page)
 
-            # 2. Nuclear Option: Remove from DOM if still present
-            logger.info("Nuclear dismissal: removing modals from DOM via evaluate...")
-            page.evaluate("""
-                document.querySelectorAll("[data-nuiexp='timelineModal'], .sapcnqr-dialog, [role='dialog'][aria-modal='true']").forEach(el => {
-                    el.style.display = 'none';
-                    el.remove();
-                });
-                document.querySelectorAll(".sapMDialog").forEach(el => el.remove());
-                document.body.classList.remove("sapMDialog-Open");
-            """)
-            page.wait_for_timeout(1000)
-
-    @contextlib.contextmanager
     def _session_lock(self):
-        """Simple file-based lock for concurrency safety."""
-        lock_file = f"{self.session_file}.lock"
-        with open(lock_file, "w") as f:
-            try:
-                # Exclusive lock, non-blocking if possible (but we'll wait)
-                import fcntl
-                fcntl.flock(f, fcntl.LOCK_EX)
-                yield
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-                try:
-                    os.remove(lock_file)
-                except Exception:
-                    pass
+        return session_lock(Path(self.session_file))
 
     def _check_session(self, page: Any) -> None:
         """Checks if the current page is a login/signin page, indicating an expired session."""
@@ -803,102 +1094,87 @@ class ConcurBrowserClient:
             title = page.title().lower()
             if "sign in" in title or "login" in title:
                 logger.error("Session expired detected via URL/Title redirection.")
+                if self.desktop:
+                    raise ConcurSessionExpiredError(SIGN_IN_MESSAGE)
                 raise ConcurSessionExpiredError(
                     "Your SAP Concur session has expired. Please re-run the login command:\n"
                     "  ccworks session login"
                 )
 
     @contextmanager
-    def _browser_page(self, headless: bool = True, viewport_height: int = 800):
-        """Chromium with the saved session, yielding a page and closing after.
-
-        Twenty-one call sites repeated this launch/new_context/new_page preamble
-        and its `finally: browser.close()`. One definition means session handling
-        (and anything that has to change about it) lives in one place.
-
-        Deliberately not used by run_headed_login, which must start with no
-        stored state and writes the session file itself.
-        """
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(
-                storage_state=self.session_file,
-                viewport={"width": 1280, "height": viewport_height},
-            )
-            page = context.new_page()
-            try:
-                yield page
-            except ConcurSessionExpiredError:
-                # Do not persist here: the context now holds a redirect-to-login
-                # state, and saving it would clobber a session that may still be
-                # good for other work.
-                raise
+    def _driver(self):
+        with ExitStack() as stack:
+            if self.desktop:
+                # The driver and Chrome inherit a private location for profiles
+                # and download staging. Keep it available until they exit.
+                env = stack.enter_context(driver_temp_environment(Path(self.session_file).parent))
             else:
-                # Concur's JWT carries roughly a 60-minute TTL and is refreshed
-                # in-browser during use. Every run used to load the session file
-                # and never write it back, so the refreshed cookie was discarded
-                # at close and the next invocation re-presented the original --
-                # which expires 60 minutes after login regardless of how much
-                # activity happened in between. Persisting the state means each
-                # run inherits the freshest cookies.
-                try:
-                    with self._session_lock():
-                        context.storage_state(path=self.session_file)
-                    logger.debug("Refreshed session state written back.")
-                except Exception as exc:
-                    logger.debug(f"_browser_page: could not persist session state: {exc!r}")
+                env = None
+            try:
+                playwright = stack.enter_context(sync_playwright())
             finally:
-                browser.close()
+                if env is not None:
+                    env()
+            yield playwright
+
+    @contextmanager
+    def _browser_page(self, headless: bool = True, viewport_height: int = 800):
+        """Use and refresh the session under one lock for the whole operation."""
+        path = Path(self.session_file)
+        with self._session_lock():
+            if self.desktop and (path.is_symlink() or not path.is_file()):
+                raise ConcurSessionExpiredError(SIGN_IN_MESSAGE)
+            with self._driver() as p:
+                browser = self.browser_launch.launch(p.chromium, headless=headless)
+                try:
+                    context = browser.new_context(
+                        storage_state=self.session_file,
+                        viewport={"width": 1280, "height": viewport_height},
+                    )
+                    page = context.new_page()
+                    page.add_locator_handler(
+                        page.locator("#trustarc-banner-overlay"),
+                        lambda: self._close_cookie_banner(page),
+                    )
+                    yield page
+                    # Keep only usable refreshed state. A caller may have caught
+                    # a login redirect and returned an error result.
+                    from ccworks.safari_login import _require_auth_state
+
+                    try:
+                        refreshed = context.storage_state()
+                        if self.desktop:
+                            _require_auth_state(refreshed, self.base_url)
+                        save_state_atomically(path, refreshed)
+                    except Exception:
+                        logger.debug("Could not refresh saved session state.")
+                finally:
+                    browser.close()
 
     def _wait_for_dashboard(self, page: Any) -> None:
         """Helper to wait for Concur's dynamic SPA dashboard elements to load."""
         self._check_session(page)
         logger.info("Waiting for Concur dashboard to render (handling loading spinners)...")
         try:
-            page.wait_for_load_state("load", timeout=15000)
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
             pass
 
-        # Smart wait loop: wait until all Concur busy indicators (blue loading dots) disappear
-        try:
-            logger.info("Waiting for all Concur busy indicators to clear...")
-            indicator = page.locator(".sapcnqr-busy-indicator, .spndpkg-full-page-busyIndicator-wrapper")
-            start_time = time.time()
-            page.wait_for_timeout(500)
-            
-            while time.time() - start_time < 30:
-                visible_count = 0
-                count = indicator.count()
-                for i in range(count):
-                    try:
-                        if indicator.nth(i).is_visible():
-                            visible_count += 1
-                    except Exception:
-                        continue
-                if visible_count == 0:
-                    break
-                page.wait_for_timeout(500)
-            logger.info("Concur busy indicators cleared.")
-        except Exception as e:
-            logger.warning(f"Proceeding after busy indicator wait timeout: {str(e)}")
+        # The full-page "busyIndicator-wrapper" is permanent content in live
+        # Concur. Receipt spinners may also remain visible while reports are
+        # ready. Wait for report data and let clicks await blocking overlays.
 
         combined_selectors = [
-            "#create-report-btn",
-            "button:has-text('Create New Report')",
-            "button:has-text('Create Report')",
-            "button:has-text('Create Expense Report')",
-            "span:has-text('Create Expense Report')",
             ".no-reports",
             ".report-card",
             ".report-tile",
             ".cnqr-report-card",
             ".sapMCard",
-            "h2:has-text('Available Receipts')"
         ]
         combined_str = ", ".join(combined_selectors)
 
         try:
-            page.locator(combined_str).first.wait_for(state="visible", timeout=15000)
+            page.locator(combined_str).filter(visible=True).first.wait_for(state="visible", timeout=15000)
             logger.info("Dashboard components loaded and visible.")
         except Exception as e:
             logger.warning(f"Proceeding after dashboard load timeout: {str(e)}")
@@ -919,13 +1195,14 @@ class ConcurBrowserClient:
         combined_selectors = [
             "button:has-text('Submit Report')",
             "button:has-text('Report Details')",
+            ".sapcnqr-data-grid-list__row",
             ".expense-list",
             "[class*='report-header']",
             ".sapMLIB"
         ]
         combined_str = ", ".join(combined_selectors)
         try:
-            page.locator(combined_str).first.wait_for(state="visible", timeout=15000)
+            page.locator(combined_str).filter(visible=True).first.wait_for(state="visible", timeout=15000)
             logger.info("Report details view loaded.")
         except Exception as e:
             logger.warning(f"Proceeding after report view load timeout: {str(e)}")
@@ -953,83 +1230,65 @@ class ConcurBrowserClient:
             logger.debug(f"_saved_jwt_expiry: {exc!r}")
         return None
 
-    def run_headed_login(self) -> None:
-        """
-        Launches a headed browser instance to let the user log in manually
-        and handle MFA/2FA or SSO. Once logged in, it saves the session state.
-        """
-        logger.info("Starting headed browser for login...")
-        import sys
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context(viewport={"width": 1280, "height": 800})
-            page = context.new_page()
-
-            logger.info(f"Navigating to login page: {self.base_url}")
-            page.goto(self.base_url)
-
-            # Write all interactive prompts to stderr so they show up even when stdout is redirected
-            sys.stderr.write("\n" + "=" * 80 + "\n")
-            # This command deliberately starts with an empty cookie jar, so the
-            # Concur login screen appears even when the saved session is fine.
-            # Without saying so, that looks like the existing session failing.
-            saved = self._saved_jwt_expiry()
-            if saved:
-                when, mins = saved
-                if mins is None:
-                    sys.stderr.write(f" NOTE: a saved session already exists (expiry {when}).\n")
-                elif mins > 0:
-                    sys.stderr.write(f" NOTE: a saved session already exists and is still "
-                                     f"usable for {mins:.0f} more minute(s) (until {when}).\n")
-                else:
-                    sys.stderr.write(f" NOTE: the saved session expired at {when}.\n")
-                sys.stderr.write(" This command always begins a fresh login with no stored\n")
-                sys.stderr.write(" cookies, so you will see the Concur login screen either way.\n")
-                sys.stderr.write(" Press Ctrl-C now to keep the existing session instead.\n")
-                sys.stderr.write("-" * 80 + "\n")
-            sys.stderr.write(" ACTION REQUIRED:\n")
-            sys.stderr.write(" 1. In the opened browser window, log in to SAP Concur.\n")
-            sys.stderr.write(" 2. Complete any MFA/2FA, Single Sign-On (SSO), or Captchas if prompted.\n")
-            sys.stderr.write(" 3. Once you see the Concur Homepage / Dashboard (fully logged in),\n")
-            sys.stderr.write("    return to this terminal and press ENTER to save your session.\n")
-            sys.stderr.write("=" * 80 + "\n\n")
-            sys.stderr.flush()
-
-            sys.stderr.write("Press ENTER here after you have logged in and see the Concur home page... ")
-            sys.stderr.flush()
-            # Read from stdin
-            sys.stdin.readline()
-
-            # Save authenticated state with lock
-            with self._session_lock():
-                context.storage_state(path=self.session_file)
-            logger.info(f"Session state successfully saved to {self.session_file}")
-            browser.close()
-            logger.info("Browser closed.")
-
-            # Saving state is not the same as capturing a usable session. If the
-            # dashboard had not finished loading when ENTER was pressed, Concur
-            # has not issued its JWT yet and the file is saved without one --
-            # which looked like a successful login, reported "complete", and then
-            # failed on the next command. Say so instead.
-            saved = self._saved_jwt_expiry()
-            if saved is None:
-                raise RuntimeError(
-                    "Login did not capture a Concur session: no JWT cookie was "
-                    "saved. This usually means ENTER was pressed before the Concur "
-                    "dashboard finished loading. Run `ccworks session login` again "
-                    "and wait until the expense dashboard is fully visible before "
-                    "pressing ENTER."
-                )
+    def _confirm_terminal_login(self) -> bool:
+        # Write all interactive prompts to stderr so they show up even when stdout is redirected
+        sys.stderr.write("\n" + "=" * 80 + "\n")
+        # This command deliberately starts with an empty cookie jar, so the
+        # Concur login screen appears even when the saved session is fine.
+        # Without saying so, that looks like the existing session failing.
+        saved = self._saved_jwt_expiry()
+        if saved:
             when, mins = saved
-            if mins is not None and mins <= 0:
-                raise RuntimeError(
-                    f"Login saved an already-expired Concur JWT (expired {when}). "
-                    f"Run `ccworks session login` again."
-                )
-            if mins is not None:
-                logger.info(f"Concur JWT captured; valid for {mins:.0f} more minute(s) "
-                            f"(until {when}).")
+            if mins is None:
+                sys.stderr.write(f" NOTE: a saved session already exists (expiry {when}).\n")
+            elif mins > 0:
+                sys.stderr.write(f" NOTE: a saved session already exists and is still "
+                                 f"usable for {mins:.0f} more minute(s) (until {when}).\n")
+            else:
+                sys.stderr.write(f" NOTE: the saved session expired at {when}.\n")
+            sys.stderr.write(" This command always begins a fresh login with no stored\n")
+            sys.stderr.write(" cookies, so you will see the Concur login screen either way.\n")
+            sys.stderr.write(" Press Ctrl-C now to keep the existing session instead.\n")
+            sys.stderr.write("-" * 80 + "\n")
+        sys.stderr.write(" ACTION REQUIRED:\n")
+        sys.stderr.write(" 1. In the opened browser window, log in to SAP Concur.\n")
+        sys.stderr.write(" 2. Complete any MFA/2FA, Single Sign-On (SSO), or Captchas if prompted.\n")
+        sys.stderr.write(" 3. Once you see the Concur Homepage / Dashboard (fully logged in),\n")
+        sys.stderr.write("    return to this terminal and press ENTER to save your session.\n")
+        sys.stderr.write("=" * 80 + "\n\n")
+        sys.stderr.flush()
+
+        sys.stderr.write("Press ENTER here after you have logged in and see the Concur home page... ")
+        sys.stderr.flush()
+        # Read from stdin
+        if not sys.stdin.readline():
+            return False
+
+        return True
+
+    def run_headed_login(self, confirm: Optional[Callable[[], bool]] = None) -> None:
+        """Capture an isolated candidate session after the user confirms sign-in."""
+        from ccworks.safari_login import LoginCancelled, _require_auth_state
+
+        with self._driver() as p:
+            browser = self.browser_launch.launch(p.chromium, headless=False)
+            try:
+                context = browser.new_context(viewport={"width": 1280, "height": 800})
+                page = context.new_page()
+                page.goto(self.base_url, timeout=30000)
+                if not (confirm or self._confirm_terminal_login)():
+                    raise LoginCancelled("Login cancelled")
+                state = context.storage_state()
+                _require_auth_state(state, self.base_url)
+                with self._session_lock():
+                    save_state_atomically(Path(self.session_file), state)
+            finally:
+                browser.close()
+
+    def verify_session_reuse(self, headless: bool = True) -> None:
+        """Prove saved-state reuse in a fresh context without capturing report data."""
+        with self._browser_page(headless=headless) as page:
+            verify_dashboard_session(page, self.base_url)
 
     def check_session_validity(self, headless: bool = True) -> Dict[str, Any]:
         """
@@ -1553,6 +1812,13 @@ class ConcurBrowserClient:
             transaction_indices = [idx + 1 if idx == 0 else idx for idx in transaction_indices]
 
         indices = [transaction_indices] if isinstance(transaction_indices, int) else transaction_indices
+        if expense_type and business_purpose is None and comment is None:
+            result = self._apply_type_updates(
+                report_name, [{"index": i, "expense_type": expense_type} for i in indices],
+                headless=headless, require_identity=False)
+            order = {i: position for position, i in enumerate(indices)}
+            result["results"].sort(key=lambda r: order[r["index"]])
+            return result
         logger.info(f"Updating transactions at indices {indices} in report '{report_name}' (headless={headless})...")
         with self._browser_page(headless=headless) as page:
             try:
@@ -1714,9 +1980,6 @@ class ConcurBrowserClient:
 
                         # Focus on the detail pane/side panel
                         detail_pane = page.locator("#sapcnqr-layout-side-panel-elements, .sapcnqr-layout-side-panel__elements, .ere__dynamic-main-content").filter(visible=True).first
-                        if detail_pane.count() == 0:
-                            # Fallback to whole page if specific pane ID not found
-                            detail_pane = page
                         # Tracking successes
                         updates_attempted = 0
                         updates_found = 0
@@ -1736,20 +1999,17 @@ class ConcurBrowserClient:
                         updates_found = updates_attempted - len(field_errors)
                         for err in field_errors:
                             logger.warning(f"  [{current_idx}] {err}")
-                            results[current_idx-1]["success"] = False
-                            results[current_idx-1]["validation_error"] = err
 
 
                         # Save the changes
-                        saved, save_error = self._click_save_expense(page)
+                        save_warnings: List[str] = []
+                        saved, save_error = self._click_save_expense(page, warnings=save_warnings)
                         if not saved:
                             # This used to press Enter and then set saved = True
                             # regardless ("assume success if we reached here"),
                             # which reported an unsaved edit as saved. A save that
                             # could not be performed is a failure.
                             logger.error(f"  [{current_idx}] {save_error}")
-                            results[current_idx-1]["success"] = False
-                            results[current_idx-1]["validation_error"] = save_error
 
                         if saved:
                             logger.info(f"  [{current_idx}] Changes saved.")
@@ -1765,22 +2025,29 @@ class ConcurBrowserClient:
                             except Exception as exc:
                                 logger.debug(f"update_report_transaction: ignoring {exc!r}")
 
-                            overall_success = (updates_found == updates_attempted)
-                            results.append({
-                                "index": current_idx, 
-                                "success": overall_success, 
-                                "partial_success": not overall_success and updates_found > 0,
-                                "validation_error": modal_msg
-                            })
                         else:
-                            logger.warning(f"  [{current_idx}] Could not find a visible 'Save' button.")
-                            # Final attempt: dispatch enter key on the comment field
-                            try:
-                                inp_comment.press("Enter")
-                                logger.info(f"  [{current_idx}] Attempted Enter key on comment field.")
-                                results.append({"index": current_idx, "success": True, "note": "Used Enter key instead of Save button"})
-                            except Exception:
-                                results.append({"index": current_idx, "success": False, "error": "Save button not found and Enter key failed"})
+                            modal_msg = None
+
+                        # Results are appended in request order, which need not
+                        # match the report's row indices. Build this row's result
+                        # locally so failures cannot overwrite an earlier row.
+                        errors = list(field_errors)
+                        if not saved:
+                            errors.append(save_error or "Could not save expense")
+                        if modal_msg:
+                            errors.append(modal_msg)
+                        row_result = {
+                            "index": current_idx,
+                            "success": saved and not errors,
+                            "partial_success": saved and bool(errors) and updates_found > 0,
+                            "validation_error": "; ".join(errors) if errors else None,
+                            "saved": saved,
+                        }
+                        if save_warnings:
+                            row_result.update(warnings=save_warnings, ready_to_submit=False)
+                        if errors:
+                            row_result["error"] = "; ".join(errors)
+                        results.append(row_result)
                         
                         page.wait_for_timeout(2000)
 
@@ -1791,9 +2058,9 @@ class ConcurBrowserClient:
                 self._take_screenshot(page, "update_transactions_final")
 
                 return {
-                    "success": any(r["success"] for r in results),
                     "report_name": report_name,
-                    "results": results
+                    **self._update_summary(results),
+                    "success": bool(results) and all(r["success"] for r in results),
                 }
 
             except Exception as e:
@@ -1822,6 +2089,47 @@ class ConcurBrowserClient:
                 logger.error(f"Failed to get allocations: {str(e)}")
                 self._take_screenshot(page, "get_allocations_error")
                 return {"success": False, "error": str(e)}
+    def set_report_allocations(self, report_name, department, fund, program=None,
+                               transaction_indices=None, dry_run=False, headless=True):
+        """Set a common 100% allocation using native bulk selection.
+
+        Indices are zero-based; None selects all expenses. Existing matching
+        allocations are skipped, while conflicting allocations/splits fail the
+        preflight before any write. Other chartstring fields are preserved.
+        """
+        from ccworks.bulk_allocations import BulkAllocator
+        return BulkAllocator(self, report_name, department, fund, program,
+                             transaction_indices, dry_run, headless).run()
+
+    ALLOCATION_ADD_BUTTON = ("[data-nuiexp='allocations-addBtn'], "
+                             "[data-nuiexp='sal-btn-buttonbar-add']")
+    ALLOCATION_REMOVE_BUTTON = ("[data-nuiexp='allocations-removeBtn'], "
+                                "[data-nuiexp='sal-btn-buttonbar-remove']")
+    ALLOCATION_SAVE_BUTTON = ("[data-nuiexp='allocation-modal-save'], "
+                              "[data-nuiexp='sal-btn-allocation-modal-save']")
+    ALLOCATION_ADD_CONFIRM = ("[data-nuiexp='Ct-add-btn'], [data-nuiexp='At-add-btn'], "
+                              "[data-nuiexp='It-add-btn']")
+
+    def _wait_for_allocations_ready(self, page):
+        """Wait for allocation data or an explicit empty state, never a toolbar."""
+        page.wait_for_function(r"""() => {
+            const visible = e => !!(e && getComputedStyle(e).visibility !== 'hidden' &&
+                (e.getClientRects().length || (getComputedStyle(e).display === 'contents' &&
+                    [...e.children].some(visible))));
+            const roots = [...document.querySelectorAll(
+                "[data-nuiexp='sal-dialog-allocations']")].filter(visible);
+            const root = roots[0] || [...document.querySelectorAll(
+                '.allocation-grid-container, #allocations-list')].find(visible);
+            if (!root) return false;
+            if (/No\s+Allocations|No allocations found/i.test(root.innerText)) return true;
+            return [...root.querySelectorAll('.allocation-row, .sapMLIB, [role="row"]')]
+                .some(row => {
+                    if (!visible(row) || row.querySelector('[role="columnheader"]')) return false;
+                    const text = row.innerText.trim();
+                    return text && !/Default Allocation|Sort column|^Select all rows/.test(text);
+                });
+        }""", timeout=10000)
+
     def _open_allocations_modal(self, page, report_name, transaction_index):
         """Open the Allocations modal for a 0-based transaction index.
 
@@ -1868,7 +2176,7 @@ class ConcurBrowserClient:
                 page.wait_for_timeout(1200)
                 continue
             item.click()
-            page.wait_for_timeout(2000)
+            self._wait_for_allocations_ready(page)
             return row
         raise RuntimeError(last_err)
 
@@ -1880,16 +2188,24 @@ class ConcurBrowserClient:
         expense that has none look allocated -- and makes a failed write verify
         against the very code it failed to change.
         """
+        self._wait_for_allocations_ready(page)
         allocations = []
-        container = page.locator(".allocation-grid-container, #allocations-list, "
-                                 ".sapMListUl").filter(visible=True).first
+        container = page.locator("[data-nuiexp='sal-dialog-allocations']").filter(visible=True).first
+        if container.count() == 0:
+            container = page.locator(".allocation-grid-container, #allocations-list, "
+                                     ".sapMListUl").filter(visible=True).first
         if container.count() == 0:
             return allocations
-        body = (container.text_content() or "")
+        body = container.inner_text()
         if "No Allocations" in body or "No allocations found" in body:
             return allocations
         for r in container.locator(".allocation-row, .sapMLIB, [role='row']").all():
-            text = " ".join((r.text_content() or "").split())
+            # The SAL grid uses display:contents on rows: the row has no box
+            # of its own even while all its cells and inputs are visible.
+            if (not r.is_visible() and r.locator(":visible").count() == 0
+                    or r.locator("[role='columnheader']").count()):
+                continue
+            text = " ".join(r.inner_text().split())
             if not text or "Default Allocation" in text:
                 continue
             # Skip the column-header row: it carries the sort affordances and the
@@ -1897,7 +2213,12 @@ class ConcurBrowserClient:
             # the count and makes a cleared expense look allocated.
             if "Sort column" in text or text.startswith("Select all rows"):
                 continue
-            allocations.append({"raw_text": text})
+            allocation = {"raw_text": text}
+            value = r.locator("input[data-nuiexp='spend-common__amount-input']").first
+            if value.count():
+                allocation["allocation_input"] = value.input_value()
+                allocation["allocation_input_label"] = value.get_attribute("aria-label") or ""
+            allocations.append(allocation)
         if not allocations:
             codes = container.locator(".allocation-code")
             for i in range(codes.count()):
@@ -1941,8 +2262,10 @@ class ConcurBrowserClient:
         if not before:
             return 0, None
 
-        container = page.locator(".allocation-grid-container, #allocations-list, "
-                                 ".sapMListUl").filter(visible=True).first
+        container = page.locator("[data-nuiexp='sal-dialog-allocations']").filter(visible=True).first
+        if container.count() == 0:
+            container = page.locator(".allocation-grid-container, #allocations-list, "
+                                     ".sapMListUl").filter(visible=True).first
         boxes = container.locator("input[type='checkbox']")
         if boxes.count() == 0:
             return 0, "no row checkboxes found in the allocations grid"
@@ -1951,7 +2274,7 @@ class ConcurBrowserClient:
         boxes.nth(0).click(force=True)
         page.wait_for_timeout(600)
 
-        remove = page.locator("[data-nuiexp='allocations-removeBtn']").filter(visible=True).first
+        remove = page.locator(self.ALLOCATION_REMOVE_BUTTON).filter(visible=True).first
         if remove.count() == 0:
             return 0, "Remove button not found in the allocations modal"
         if not remove.is_enabled():
@@ -1972,7 +2295,7 @@ class ConcurBrowserClient:
             confirm.click()
             page.wait_for_timeout(1200)
 
-        save = page.locator("[data-nuiexp='allocation-modal-save']").filter(visible=True).first
+        save = page.locator(self.ALLOCATION_SAVE_BUTTON).filter(visible=True).first
         if save.count() == 0:
             save = page.locator("button:has-text('Save')").filter(visible=True).last
         if save.count() == 0:
@@ -1995,10 +2318,9 @@ class ConcurBrowserClient:
         # Exact selector only. A comma-list including button:has-text('Add')
         # resolves in DOM order and matches the page's "Add Expense" toolbar
         # button, which the modal overlay then blocks.
-        add_btn = page.locator("[data-nuiexp='allocations-addBtn']").filter(visible=True).first
+        add_btn = page.locator(self.ALLOCATION_ADD_BUTTON).filter(visible=True).first
         if add_btn.count() == 0:
-            return [], ("Could not find the Allocations modal 'Add' button "
-                        "([data-nuiexp='allocations-addBtn']).")
+            return [], "Could not find the Allocations modal 'Add' button."
         add_btn.click(force=True)
         page.wait_for_timeout(2000)
 
@@ -2014,7 +2336,7 @@ class ConcurBrowserClient:
             self._take_screenshot(page, "add_allocation_field_error")
             return [], "; ".join(field_errors)
 
-        save_add_btn = page.locator("[data-nuiexp='Ct-add-btn']").filter(visible=True).first
+        save_add_btn = page.locator(self.ALLOCATION_ADD_CONFIRM).filter(visible=True).first
         if save_add_btn.count() == 0:
             save_add_btn = page.locator("button:has-text('Save')").filter(visible=True).last
         if save_add_btn.count() == 0:
@@ -2022,7 +2344,7 @@ class ConcurBrowserClient:
         save_add_btn.click()
         page.wait_for_timeout(2000)
 
-        save_alloc_btn = page.locator("[data-nuiexp='allocation-modal-save']").filter(
+        save_alloc_btn = page.locator(self.ALLOCATION_SAVE_BUTTON).filter(
             visible=True).first
         if save_alloc_btn.count() == 0:
             save_alloc_btn = page.locator("button:has-text('Save')").filter(visible=True).last
@@ -2627,7 +2949,7 @@ class ConcurBrowserClient:
                     logger.warning("Timed out waiting for line items to appear using standard selectors.")
 
                 # List expenses line items
-                expenses = []
+                expenses: List[Dict[str, Any]] = []
                 # One shared definition of what an expense row is, so a row's
                 # index means the same thing here as in the write paths.
                 expense_rows, row_diagnostics = self._collect_expense_rows(page, name, report_num)
@@ -3063,7 +3385,7 @@ class ConcurBrowserClient:
                 # ordinary on a purchasing-card statement. Dropping the second was
                 # silent data loss on a reconciliation tool. Identical rows are
                 # reported instead, so a genuine scraping duplicate is still visible.
-                text_counts = {}
+                text_counts: Dict[str, int] = {}
                 for exp in expenses:
                     text_counts[exp["raw_text"]] = text_counts.get(exp["raw_text"], 0) + 1
                 identical_groups = [
@@ -3178,27 +3500,19 @@ class ConcurBrowserClient:
                     normalized_name = " ".join(report_name.split()).lower()
                     all_cards_loc = page.locator(", ".join(card_selectors))
                     count = all_cards_loc.count()
-                    print(f"DEBUG: Checking {count} total potential cards for a match...", file=sys.stderr)
+                    logger.debug("Checking %s potential report cards.", count)
                     for i in range(count):
                         c = all_cards_loc.nth(i)
                         card_text = c.text_content() or ""
                         clean_text = " ".join(card_text.split())
-                        print(f"DEBUG:   Card {i} text: '{clean_text}'", file=sys.stderr)
                         if normalized_name in clean_text.lower():
                             card = c
                             logger.info(f"Found report card using flexible text matching at index {i}.")
                             break
 
                 if not card:
-                    print(f"DEBUG: Current URL: {page.url}", file=sys.stderr)
-                    print(f"DEBUG: Page Title: {page.title()}", file=sys.stderr)
+                    logger.debug("No matching report card was visible.")
                     self._take_screenshot(page, "allocations_report_not_found")
-                    # Try to find ANY text that looks like reports
-                    try:
-                        all_text = page.locator("body").text_content()
-                        print(f"DEBUG: Page Text (first 1000 chars): {all_text[:1000]}", file=sys.stderr)
-                    except Exception:
-                        pass
                     raise FileNotFoundError(f"Could not find report '{report_name}'.")
 
                 card.click()
@@ -3835,9 +4149,12 @@ class ConcurBrowserClient:
                                       "`report apply-json`, which addresses rows by index "
                                       "through the shared row helper.")}
 
+                results = []
                 for idx, row in enumerate(rows):
                     merchant_elem = row.locator(".recon-merchant, strong").first
                     if merchant_elem.count() == 0:
+                        results.append({"index": idx + 1, "success": False,
+                                        "error": "Merchant field not found"})
                         continue
                     
                     raw_text = merchant_elem.text_content().strip()
@@ -3852,6 +4169,8 @@ class ConcurBrowserClient:
 
                     if not matched_rule:
                         logger.warning(f"No reconciliation rule matched for '{raw_text}'. Skipping.")
+                        results.append({"index": idx + 1, "success": False,
+                                        "error": "No reconciliation rule matched"})
                         continue
 
                     logger.info(f"Reconciling item '{raw_text}' using rule: {matched_rule}")
@@ -3874,18 +4193,19 @@ class ConcurBrowserClient:
                         expense_type=matched_rule.get("expense_type"),
                         purpose=matched_rule.get("business_purpose"),
                         comment=matched_rule.get("comment"))
-                    if field_errors:
-                        logger.warning(f"  Transaction '{raw_text}': " + "; ".join(field_errors))
+                    errors = list(field_errors)
 
                     # Allocation Code
                     inp_alloc = input_context.locator("input.recon-allocation, input[id*='allocation']").first
-                    if inp_alloc.count() > 0:
-                        inp_alloc.fill(matched_rule.get("allocation_code", ""))
+                    if "allocation_code" in matched_rule:
+                        if inp_alloc.count() > 0:
+                            inp_alloc.fill(matched_rule["allocation_code"])
+                        else:
+                            errors.append("Allocation field not found")
                     
                     # Optional receipt attachment
                     receipt_path = matched_rule.get("receipt_path") or matched_rule.get("receipt")
                     if receipt_path:
-                        import os
                         if os.path.exists(receipt_path):
                             inp_receipt = input_context.locator("input.recon-receipt-file, input[type='file'], input[id*='receipt']").first
                             if inp_receipt.count() > 0:
@@ -3893,12 +4213,21 @@ class ConcurBrowserClient:
                                 page.wait_for_timeout(2000)
                                 logger.info(f"  Attached receipt '{receipt_path}' to transaction '{raw_text}'.")
                             else:
-                                logger.warning(f"  Could not find receipt upload input for '{raw_text}'.")
+                                errors.append("Receipt upload input not found")
+                        else:
+                            errors.append("Receipt file not found")
                     
                     # Save this transaction
-                    saved, save_error = self._click_save_expense(page, input_context)
+                    save_warnings: List[str] = []
+                    saved, save_error = self._click_save_expense(page, input_context, warnings=save_warnings)
                     if not saved:
-                        logger.warning(f"  Transaction '{raw_text}': {save_error}")
+                        errors.append(save_error or "Could not save expense")
+                    row_result = {"index": idx + 1, "success": saved and not errors}
+                    if save_warnings:
+                        row_result.update(warnings=save_warnings, ready_to_submit=False)
+                    if errors:
+                        row_result["error"] = "; ".join(errors)
+                    results.append(row_result)
                     
                     if not saved and not has_inline_inputs:
                         # Try closing the pane if we can't save
@@ -3908,26 +4237,25 @@ class ConcurBrowserClient:
 
                 self._take_screenshot(page, "reconcile_all_saved")
 
+                if not all(result["success"] for result in results):
+                    return {"success": False, "submitted": False, "results": results,
+                            "error": "Not all transactions were reconciled; submission was skipped."}
+
                 if not submit:
                     logger.info("Report reconciliation completed. Skipping submission as requested (submit=False).")
-                    return {"success": True, "submitted": False}
-
-                # Click Submit Report
-                submit_btn = page.locator("#submit-entire-report-btn").first
-                if submit_btn.count() > 0 and submit_btn.is_enabled():
-                    # Register dialog accept handler
-                    page.on("dialog", lambda dialog: dialog.accept())
-                    submit_btn.click()
-                    page.wait_for_timeout(3000)
-                    self._take_screenshot(page, "reconcile_submitted")
-                    logger.info("Report successfully submitted!")
-                    return {"success": True, "submitted": True}
-                else:
-                    raise RuntimeError("Submit Report button is missing or not enabled. Check if all transactions are reconciled.")
+                    return {"submitted": False, **self._update_summary(results)}
+                if any(r.get("warnings") for r in results):
+                    return {**self._update_summary(results), "success": False, "submitted": False,
+                            "error": "Draft edits were saved but Concur flagged information required for submission."}
 
             except Exception as e:
                 self._take_screenshot(page, "reconcile_error")
                 raise e
+
+        # Close and persist the reconciliation session before invoking the
+        # shared submission flow, including its report-totals confirmation.
+        submission = self.submit_report(report_name=report_name, headless=headless)
+        return {**submission, "submitted": bool(submission.get("success")), "results": results}
     def attach_receipt_to_transaction(self, report_name: str, merchant_or_id: str, receipt_file_path: str, headless: bool = True) -> Dict[str, Any]:
         """
         Navigates to the report details view, locates the transaction row matching merchant_or_id,
@@ -4028,96 +4356,32 @@ class ConcurBrowserClient:
                 self._take_screenshot(page, "attach_receipt_error")
                 raise e
     def submit_report(self, report_name: str, headless: bool = True) -> Dict[str, Any]:
-        """
-        Locates an expense report by name, opens it, and clicks the 'Submit Report' button.
-        Handles the confirmation dialog that typically follows.
-        """
-        logger.info(f"Submitting report '{report_name}' via browser (headless={headless})...")
-        with self._browser_page(headless=headless) as page:
-            try:
-                page.goto(f"{self.base_url}/nui/expense", timeout=30000)
-                self._wait_for_dashboard(page)
-                self._take_screenshot(page, "submit_report_start")
+        """Submit through known UI stages and independently verify persisted status."""
+        from ccworks.submission import ReportSubmission
 
-                # Locate and open the report
-                card = page.locator(".report-tile, .report-card").filter(has_text=report_name).first
-                if card.count() == 0:
-                    card = page.locator(".sapMCard, .sapMLIB").filter(has_text=report_name).first
-                
-                if card.count() == 0:
-                    raise FileNotFoundError(f"Could not find report '{report_name}'.")
-
-                card.click()
-                page.wait_for_timeout(3000)
-                self._wait_for_report_view(page)
-                self._take_screenshot(page, "submit_report_opened")
-
-                # Click Submit Report
-                # The button ID #submit-entire-report-btn is often used in the modern UI
-                submit_btn = page.locator("#submit-entire-report-btn, button:has-text('Submit Report')").filter(visible=True).first
-                
-                if submit_btn.count() > 0 and submit_btn.is_enabled():
-                    # Register dialog accept handler for the confirmation popup
-                    page.on("dialog", lambda dialog: dialog.accept())
-                    
-                    submit_btn.click()
-                    logger.info("Clicked 'Submit Report' button.")
-                    
-                    # Wait for a potential second confirmation button (modern UI often has a summary dialog)
-                    page.wait_for_timeout(2000)
-                    final_confirm = page.locator("button:has-text('Submit Report'), .sapMBtn:has-text('Submit Report')").filter(visible=True).first
-                    if final_confirm.count() > 0 and final_confirm.is_enabled():
-                        final_confirm.click()
-                        logger.info("Clicked final 'Submit Report' confirmation.")
-                    
-                    page.wait_for_timeout(5000)
-                    self._take_screenshot(page, "submit_report_final")
-                    
-                    # Verify if we are back on the dashboard or see a success message
-                    if page.locator("text=Report Successfully Submitted").count() > 0 or page.url.endswith("/nui/expense"):
-                        logger.info("Report successfully submitted!")
-                        return {"success": True, "message": "Report successfully submitted"}
-                    else:
-                        logger.warning("Submit button clicked, but could not verify success message. Please check manually.")
-                        return {"success": True, "message": "Submit clicked, verification pending"}
-                else:
-                    # Check if it's already submitted or disabled
-                    if submit_btn.count() > 0 and not submit_btn.is_enabled():
-                        raise RuntimeError("Submit Report button is disabled. Ensure all alerts are resolved and justifications are filled.")
-                    else:
-                        raise RuntimeError("Submit Report button not found on this page.")
-
-            except Exception as e:
-                self._take_screenshot(page, "submit_report_error")
-                logger.error(f"Failed to submit report: {str(e)}")
-                raise e
+        return ReportSubmission(self, report_name, headless).run()
     # --- Private Helpers ---
 
-    def _open_report_by_name(self, page: Any, name: str) -> None:
-        """Helper to find and open a report card by name."""
-        logger.info(f"Opening report '{name}'...")
-        
-        # Wait for content to load
+    def _named_report_cards(self, page, name):
+        """Preserve selector priority so a containing list row is not a report card."""
+        selectors = (".report-tile", ".report-card", ".sapMCard", ".sapMLIB", ".cnqr-report-card")
+        ready = page.locator(", ".join(selectors)).filter(has_text=name).filter(visible=True).first
         try:
-            page.locator(".report-tile, .report-card, .sapMCard, .sapMLIB, .cnqr-report-card, .no-reports").first.wait_for(state="visible", timeout=5000)
-        except Exception:
-            pass
+            ready.wait_for(state="visible", timeout=15000)
+        except PlaywrightTimeoutError as error:
+            raise FileNotFoundError("Requested report was not available on the dashboard") from error
+        for selector in selectors:
+            cards = page.locator(selector).filter(has_text=name).filter(visible=True)
+            if cards.count():
+                return cards
+        raise FileNotFoundError("Requested report was no longer available")
 
-        card_selectors = [".report-tile", ".report-card", ".sapMCard", ".sapMLIB", ".cnqr-report-card"]
-        card = None
-        for selector in card_selectors:
-            loc = page.locator(selector).filter(has_text=name)
-            if loc.count() > 0:
-                card = loc.first
-                break
-        
-        if not card:
-            if page.locator(".no-reports").is_visible():
-                raise FileNotFoundError(f"Dashboard is empty (No reports found). Could not find '{name}'.")
-            raise FileNotFoundError(f"Could not find report '{name}'.")
-
+    def _open_report_by_name(self, page: Any, name: str, settle: bool = True) -> None:
+        """Wait for the requested name, rather than the first loading placeholder."""
+        card = self._named_report_cards(page, name).first
         card.click()
-        page.wait_for_timeout(3000)
+        if settle:
+            page.wait_for_timeout(3000)
         self._wait_for_report_view(page)
 
     def _get_transaction_rows(self, page: Any) -> List[Any]:
@@ -4162,6 +4426,36 @@ class ConcurBrowserClient:
         """
         logger.info(f"Applying custom JSON updates to report '{report_name}' (headless={headless})...")
 
+        if self._type_only_payload(expenses):
+            return self._apply_type_updates(report_name, expenses, headless=headless,
+                                            ignore_session_budget=ignore_session_budget)
+
+        # Validate every allocation before opening a browser or applying any
+        # edits. Only null/{} mean clear; a nonempty chartstring must include
+        # both required codes so a typo cannot silently erase existing data.
+        for exp in expenses:
+            if "allocation" not in exp:
+                continue
+            spec = exp["allocation"]
+            error = None
+            if spec is not None and not isinstance(spec, dict):
+                error = "allocation must be an object or null"
+            elif spec:
+                if any(not isinstance(spec.get(key), str) or not spec[key].strip()
+                       for key in ("dept", "fund")):
+                    error = "a nonempty allocation requires nonempty dept and fund strings"
+                elif spec.get("prog") is not None and (
+                        not isinstance(spec["prog"], str) or not spec["prog"].strip()):
+                    error = "allocation prog must be a nonempty string or null"
+                elif set(spec) - {"dept", "fund", "prog"}:
+                    error = "allocation contains unknown fields"
+            if error:
+                return {
+                    "success": False,
+                    "error": f"Invalid allocation at index {exp.get('index')}: {error}. No updates applied.",
+                    "results": [{"index": exp.get("index"), "success": False, "error": error}],
+                }
+
         # Concur's JWT lasts about 60 minutes from login and is not refreshed by
         # use, so a long payload can outlive it. Refuse up front rather than
         # spending twenty minutes to die partway.
@@ -4192,7 +4486,7 @@ class ConcurBrowserClient:
                 "rows_that_would_fit": fits,
                 "results": [],
             }
-        results = []
+        results: List[Dict[str, Any]] = []
         with self._browser_page(headless=headless) as page:
             try:
                 page.goto(f"{self.base_url}/nui/expense", timeout=45000)
@@ -4416,7 +4710,8 @@ class ConcurBrowserClient:
 
 
                     # Save
-                    saved, save_error = self._click_save_expense(page, input_context)
+                    save_warnings: List[str] = []
+                    saved, save_error = self._click_save_expense(page, input_context, warnings=save_warnings)
 
                     # Allocation last, and only once the pane is closed: the
                     # allocations modal is reached from the row's kebab, not the
@@ -4469,8 +4764,11 @@ class ConcurBrowserClient:
                         if alloc_verified is not None:
                             row_result["allocation_verified"] = alloc_verified
                         results.append(row_result)
+                    results[-1]["saved"] = saved
+                    if save_warnings:
+                        results[-1].update(warnings=save_warnings, ready_to_submit=False)
                 
-                return {"success": True, "results": results}
+                return self._update_summary(results)
                 
             except Exception as e:
                 logger.error(f"Error applying JSON updates: {e}")

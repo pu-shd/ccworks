@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ccworks",
+  "version": "0.2.0",
+  "description": "Reconcile SAP Concur statements. ccworks runs in the ChatGPT desktop app on Windows or macOS. Open the app, select your organization workspace, and start a local Work session.",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true
+    }
+  }
+}
