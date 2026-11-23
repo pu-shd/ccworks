@@ -519,7 +519,10 @@ PASS/FAIL; empty groups and import failures cannot report success.
 
 The existing `docker-tests` status requires all four groups to pass. Container
 lint, format, type, release-schema and extension checks run once, alongside the
-separate host, Apple Silicon, browser and packaging jobs. Superseded PR runs are
+separate host, browser, Windows desktop and packaging jobs. CI uses no hosted
+macOS runners; build and test the macOS desktop app locally with
+`desktop/build-macos.zsh` and `desktop/test-macos.zsh` before merging changes
+that affect it (see `docs/desktop-pilot.md`). Superseded PR runs are
 canceled; main-branch runs have distinct concurrency groups. Job timeouts bound
 stalled runs. Scheduling uses measured hints rather than changing browser
 timeouts or disabling regressions.

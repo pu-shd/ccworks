@@ -160,12 +160,28 @@ class TestCISharding(unittest.TestCase):
             )
         for name in (
             "unit-tests",
-            "macos-reliability",
             "browser-smoke-tests",
             "package-build",
         ):
             self.assertIn(name, jobs)
         self.assertTrue(all(job.get("timeout-minutes", 0) > 0 for job in jobs.values()))
+
+    def test_workflows_avoid_hosted_macos_runners(self):
+        # Hosted macOS minutes are slow and costly; macOS desktop validation
+        # runs locally via desktop/build-macos.zsh and desktop/test-macos.zsh.
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(workflows, "No workflows found")
+        for path in workflows:
+            jobs = yaml.safe_load(path.read_text())["jobs"]
+            self.assertTrue(jobs, f"No jobs in {path.name}")
+            for name, job in jobs.items():
+                labels = job["runs-on"]
+                labels = [labels] if isinstance(labels, str) else labels
+                for label in labels:
+                    self.assertFalse(
+                        str(label).lower().startswith("macos"),
+                        f"{path.name}:{name} uses hosted macOS runner {label}",
+                    )
 
 
 if __name__ == "__main__":
